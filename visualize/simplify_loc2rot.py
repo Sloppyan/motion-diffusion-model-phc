@@ -1,12 +1,12 @@
 import numpy as np
 import os
 import torch
-from visualize.joints2smpl.src import config
+from mdm_core.visualize.joints2smpl.src import config
 import smplx
 import h5py
-from visualize.joints2smpl.src.smplify import SMPLify3D
+from mdm_core.visualize.joints2smpl.src.smplify import SMPLify3D
 from tqdm import tqdm
-import utils.rotation_conversions as geometry
+import mdm_core.utils.rotation_conversions as geometry
 import argparse
 
 

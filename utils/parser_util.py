@@ -18,6 +18,7 @@ def parse_and_load_from_model(parser):
     # load args from model
     model_path = get_model_path_from_args()
     args_path = os.path.join(os.path.dirname(model_path), 'args.json')
+    print(args_path)
     assert os.path.exists(args_path), 'Arguments json file was not found!'
     with open(args_path, 'r') as fr:
         model_args = json.load(fr)

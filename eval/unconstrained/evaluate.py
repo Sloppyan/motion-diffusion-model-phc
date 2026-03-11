@@ -1,4 +1,4 @@
-from eval.unconstrained.models.stgcn import STGCN
+from mdm_core.eval.unconstrained.models.stgcn import STGCN
 import pandas as pd
 import os.path as osp
 import os
@@ -9,10 +9,10 @@ import torch
 from torch.utils.data import DataLoader
 import numpy as np
 import sys as _sys
-from eval.a2m.action2motion.fid import calculate_fid
-from eval.a2m.action2motion.diversity import calculate_diversity
-from eval.unconstrained.metrics.kid import calculate_kid
-from eval.unconstrained.metrics.precision_recall import precision_and_recall
+from mdm_core.eval.a2m.action2motion.fid import calculate_fid
+from mdm_core.eval.a2m.action2motion.diversity import calculate_diversity
+from mdm_core.eval.unconstrained.metrics.kid import calculate_kid
+from mdm_core.eval.unconstrained.metrics.precision_recall import precision_and_recall
 from matplotlib import pyplot as plt
 
 TEST = False

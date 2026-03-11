@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from eval.a2m.recognition.models.stgcnutils.tgcn import ConvTemporalGraphical
-from eval.unconstrained.models.stgcnutils.graph import Graph
+from mdm_core.eval.a2m.recognition.models.stgcnutils.tgcn import ConvTemporalGraphical
+from mdm_core.eval.unconstrained.models.stgcnutils.graph import Graph
 
 __all__ = ["STGCN"]
 

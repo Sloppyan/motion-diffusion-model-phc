@@ -6,13 +6,13 @@ import os
 import torch
 import re
 
-from utils import dist_util
-from model.cfg_sampler import ClassifierFreeSampleModel
-from data_loaders.get_data import get_dataset_loader
-from eval.a2m.tools import save_metrics
-from utils.parser_util import evaluation_parser
-from utils.fixseed import fixseed
-from utils.model_util import create_model_and_diffusion, load_model_wo_clip
+from mdm_core.utils import dist_util
+from mdm_core.model.cfg_sampler import ClassifierFreeSampleModel
+from mdm_core.data_loaders.get_data import get_dataset_loader
+from mdm_core.eval.a2m.tools import save_metrics
+from mdm_core.utils.parser_util import evaluation_parser
+from mdm_core.utils.fixseed import fixseed
+from mdm_core.utils.model_util import create_model_and_diffusion, load_model_wo_clip
 
 
 def evaluate(args, model, diffusion, data):
@@ -28,10 +28,10 @@ def evaluate(args, model, diffusion, data):
 
     folder, ckpt_name = os.path.split(args.model_path)
     if args.dataset == "humanact12":
-        from eval.a2m.gru_eval import evaluate
+        from mdm_core.eval.a2m.gru_eval import evaluate
         eval_results = evaluate(args, model, diffusion, data)
     elif args.dataset == "uestc":
-        from eval.a2m.stgcn_eval import evaluate
+        from mdm_core.eval.a2m.stgcn_eval import evaluate
         eval_results = evaluate(args, model, diffusion, data)
     else:
         raise NotImplementedError("This dataset is not supported.")

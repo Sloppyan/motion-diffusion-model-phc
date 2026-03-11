@@ -9,8 +9,8 @@ from tqdm import tqdm
 import spacy
 
 from torch.utils.data._utils.collate import default_collate
-from data_loaders.humanml.utils.word_vectorizer import WordVectorizer
-from data_loaders.humanml.utils.get_opt import get_opt
+from mdm_core.data_loaders.humanml.utils.word_vectorizer import WordVectorizer
+from mdm_core.data_loaders.humanml.utils.get_opt import get_opt
 
 # import spacy
 

@@ -1,5 +1,5 @@
-from data_loaders.humanml.networks.modules import *
-from data_loaders.humanml.utils.word_vectorizer import POS_enumerator
+from mdm_core.data_loaders.humanml.networks.modules import *
+from mdm_core.data_loaders.humanml.utils.word_vectorizer import POS_enumerator
 from os.path import join as pjoin
 
 def build_models(opt):

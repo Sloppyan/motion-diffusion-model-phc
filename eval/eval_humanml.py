@@ -1,18 +1,18 @@
-from utils.parser_util import evaluation_parser
-from utils.fixseed import fixseed
+from mdm_core.utils.parser_util import evaluation_parser
+from mdm_core.utils.fixseed import fixseed
 from datetime import datetime
-from data_loaders.humanml.motion_loaders.model_motion_loaders import get_mdm_loader  # get_motion_loader
-from data_loaders.humanml.utils.metrics import *
-from data_loaders.humanml.networks.evaluator_wrapper import EvaluatorMDMWrapper
+from mdm_core.data_loaders.humanml.motion_loaders.model_motion_loaders import get_mdm_loader  # get_motion_loader
+from mdm_core.data_loaders.humanml.utils.metrics import *
+from mdm_core.data_loaders.humanml.networks.evaluator_wrapper import EvaluatorMDMWrapper
 from collections import OrderedDict
-from data_loaders.humanml.scripts.motion_process import *
-from data_loaders.humanml.utils.utils import *
-from utils.model_util import create_model_and_diffusion, load_model_wo_clip
+from mdm_core.data_loaders.humanml.scripts.motion_process import *
+from mdm_core.data_loaders.humanml.utils.utils import *
+from mdm_core.utils.model_util import create_model_and_diffusion, load_model_wo_clip
 
-from diffusion import logger
-from utils import dist_util
-from data_loaders.get_data import get_dataset_loader
-from model.cfg_sampler import ClassifierFreeSampleModel
+from mdm_core.diffusion import logger
+from mdm_core.utils import dist_util
+from mdm_core.data_loaders.get_data import get_dataset_loader
+from mdm_core.model.cfg_sampler import ClassifierFreeSampleModel
 
 torch.multiprocessing.set_sharing_strategy('file_system')
 

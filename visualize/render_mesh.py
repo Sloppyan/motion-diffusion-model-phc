@@ -1,6 +1,6 @@
 import argparse
 import os
-from visualize import vis_utils
+from mdm_core.visualize import vis_utils
 import shutil
 from tqdm import tqdm
 

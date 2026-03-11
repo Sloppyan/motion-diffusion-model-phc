@@ -145,6 +145,7 @@ def generate_text(prompts):
     prompts = prompts.split("\n")
     num_prompt = len(prompts)
     gen_mdm_motions = mdm_talker.generate_motion(prompts)
+    print(f"gen_mdm_motions.shape: {gen_mdm_motions.shape}") # (120, 24, 3)
     mat = sRot.from_euler('xyz', np.array([-np.pi / 2, 0, 0]), degrees=False).as_matrix()
     gen_mdm_motions = np.matmul(gen_mdm_motions, mat.dot(mat))
     
@@ -154,6 +155,7 @@ def generate_text(prompts):
     
     
     mdm_motions = fps_20_to_30(gen_mdm_motions)
+    print(f"After fps_20_to_30, mdm_motions.shape: {mdm_motions.shape}") # (180, 24, 3)
     ticker = 0
 
 async def send_to_clients(post):
@@ -180,6 +182,7 @@ def commandline_input():
             generate_text(command)
         
 
+# python language_to_pose_server.py --model_path /home/gxy/hay-thesis/motion-diffusion-model/save/humanml_enc_512_50steps/model000750000.pt
 def main(request):
     return {'name': 'Andrew'}
 

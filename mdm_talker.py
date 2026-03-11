@@ -11,20 +11,20 @@ import numpy as np
 import torch
 sys.path.append(os.getcwd())
 import shutil
-from data_loaders.humanml.data.dataset import HumanML3D
+from mdm_core.data_loaders.humanml.data.dataset import HumanML3D
 
-from utils.fixseed import fixseed
-from utils.parser_util import generate_args
-from utils.model_util import create_model_and_diffusion, load_model_wo_clip
-from utils import dist_util
-from model.cfg_sampler import ClassifierFreeSampleModel
-from data_loaders.get_data import get_dataset_loader
-from data_loaders.humanml.scripts.motion_process import recover_from_ric
-import data_loaders.humanml.utils.paramUtil as paramUtil
-from data_loaders.humanml.utils.plot_script import plot_3d_motion
+from mdm_core.utils.fixseed import fixseed
+from mdm_core.utils.parser_util import generate_args
+from mdm_core.utils.model_util import create_model_and_diffusion, load_model_wo_clip
+from mdm_core.utils import dist_util
+from mdm_core.model.cfg_sampler import ClassifierFreeSampleModel
+from mdm_core.data_loaders.get_data import get_dataset_loader
+from mdm_core.data_loaders.humanml.scripts.motion_process import recover_from_ric
+import mdm_core.data_loaders.humanml.utils.paramUtil as paramUtil
+from mdm_core.data_loaders.humanml.utils.plot_script import plot_3d_motion
 
-from data_loaders.tensors import collate
-from sample.generate import construct_template_variables, save_multiple_samples, load_dataset
+from mdm_core.data_loaders.tensors import collate
+from mdm_core.sample.generate import construct_template_variables, save_multiple_samples, load_dataset
 from datetime import datetime
 
 class MDMTalker:

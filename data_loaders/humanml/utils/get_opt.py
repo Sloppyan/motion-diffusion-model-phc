@@ -2,7 +2,7 @@ import os
 from argparse import Namespace
 import re
 from os.path import join as pjoin
-from data_loaders.humanml.utils.word_vectorizer import POS_enumerator
+from mdm_core.data_loaders.humanml.utils.word_vectorizer import POS_enumerator
 
 
 def is_float(numStr):

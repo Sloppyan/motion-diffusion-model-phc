@@ -1,7 +1,7 @@
 from torch.utils.data import DataLoader, Dataset
-from data_loaders.humanml.utils.get_opt import get_opt
-from data_loaders.humanml.motion_loaders.comp_v6_model_dataset import CompMDMGeneratedDataset
-from data_loaders.humanml.utils.word_vectorizer import WordVectorizer
+from mdm_core.data_loaders.humanml.utils.get_opt import get_opt
+from mdm_core.data_loaders.humanml.motion_loaders.comp_v6_model_dataset import CompMDMGeneratedDataset
+from mdm_core.data_loaders.humanml.utils.word_vectorizer import WordVectorizer
 import numpy as np
 from torch.utils.data._utils.collate import default_collate
 
@@ -35,7 +35,7 @@ class MMGeneratedDataset(Dataset):
             #                              ], axis=0)
             motion = motion[None, :]
             motions.append(motion)
-        m_lens = np.array(m_lens, dtype=np.int)
+        m_lens = np.array(m_lens, dtype=np.int64)
         motions = np.concatenate(motions, axis=0)
         sort_indx = np.argsort(m_lens)[::-1].copy()
         # print(m_lens)

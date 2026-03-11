@@ -1,10 +1,10 @@
 import torch
-from data_loaders.humanml.networks.modules import *
-from data_loaders.humanml.networks.trainers import CompTrainerV6
+from mdm_core.data_loaders.humanml.networks.modules import *
+from mdm_core.data_loaders.humanml.networks.trainers import CompTrainerV6
 from torch.utils.data import Dataset, DataLoader
 from os.path import join as pjoin
 from tqdm import tqdm
-from utils import dist_util
+from mdm_core.utils import dist_util
 
 def build_models(opt):
     if opt.text_enc_mod == 'bigru':

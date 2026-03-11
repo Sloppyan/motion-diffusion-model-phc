@@ -1,8 +1,8 @@
 import numpy as np
 import torch
 
-from utils.rotation_conversions import rotation_6d_to_matrix, matrix_to_euler_angles
-from visualize.simplify_loc2rot import joints2smpl
+from mdm_core.utils.rotation_conversions import rotation_6d_to_matrix, matrix_to_euler_angles
+from mdm_core.visualize.simplify_loc2rot import joints2smpl
 
 """
 Utility function to convert model output to a representation used by HumanIK skeletons in Maya and Motion Builder

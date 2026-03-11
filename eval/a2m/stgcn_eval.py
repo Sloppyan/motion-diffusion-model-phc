@@ -3,16 +3,16 @@ import torch
 from tqdm import tqdm
 import functools
 
-from utils.fixseed import fixseed
+from mdm_core.utils.fixseed import fixseed
 
-from eval.a2m.stgcn.evaluate import Evaluation as STGCNEvaluation
+from mdm_core.eval.a2m.stgcn.evaluate import Evaluation as STGCNEvaluation
 from torch.utils.data import DataLoader
-from data_loaders.tensors import collate
+from mdm_core.data_loaders.tensors import collate
 
 
 from .tools import format_metrics
-import utils.rotation_conversions as geometry
-from utils import dist_util
+import mdm_core.utils.rotation_conversions as geometry
+from mdm_core.utils import dist_util
 
 
 def convert_x_to_rot6d(x, pose_rep):

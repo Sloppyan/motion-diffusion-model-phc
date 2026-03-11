@@ -6,16 +6,16 @@ from argparse import Namespace
 import torch
 from cog import BasePredictor, Input, Path, BaseModel
 
-import data_loaders.humanml.utils.paramUtil as paramUtil
-from data_loaders.get_data import get_dataset_loader
-from data_loaders.humanml.scripts.motion_process import recover_from_ric
-from data_loaders.humanml.utils.plot_script import plot_3d_motion
-from data_loaders.tensors import collate
-from model.cfg_sampler import ClassifierFreeSampleModel
-from utils import dist_util
-from utils.model_util import create_model_and_diffusion, load_model_wo_clip
-from visualize.motions2hik import motions2hik
-from sample.generate import construct_template_variables
+import mdm_core.data_loaders.humanml.utils.paramUtil as paramUtil
+from mdm_core.data_loaders.get_data import get_dataset_loader
+from mdm_core.data_loaders.humanml.scripts.motion_process import recover_from_ric
+from mdm_core.data_loaders.humanml.utils.plot_script import plot_3d_motion
+from mdm_core.data_loaders.tensors import collate
+from mdm_core.model.cfg_sampler import ClassifierFreeSampleModel
+from mdm_core.utils import dist_util
+from mdm_core.utils.model_util import create_model_and_diffusion, load_model_wo_clip
+from mdm_core.visualize.motions2hik import motions2hik
+from mdm_core.sample.generate import construct_template_variables
 
 """
 In case of matplot lib issues it may be needed to delete model/data_loaders/humanml/utils/plot_script.py" in lines 89~92 as
