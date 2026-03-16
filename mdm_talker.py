@@ -110,7 +110,7 @@ class MDMTalker:
                                 arg, one_action, one_action_text in zip(collate_args, action, action_text)]
             _, self.model_kwargs = collate(collate_args)
 
-    def generate_motion(self, prompts, out_path = "mdm_out", num_repetitions = 1):
+    def generate_motion(self, prompts, out_path = "mdm_out", num_repetitions = 1, show_progress = True):
         curr_date_time = datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
         
         
@@ -143,7 +143,7 @@ class MDMTalker:
                 model_kwargs=model_kwargs,
                 skip_timesteps=0,  # 0 is the default value - i.e. don't skip any step
                 init_image=None,
-                progress=True,
+                progress=show_progress,
                 dump_steps=None,
                 noise=None,
                 const_noise=False,
