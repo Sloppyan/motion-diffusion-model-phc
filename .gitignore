@@ -132,9 +132,14 @@ dmypy.json
 .pyre/
 
 save/
+<<<<<<< Updated upstream
+=======
 ._t2m
+.envrc
 t2m/
 glove/
 docs/
 dataset/HumanML3D/
 body_models/
+visualize/output
+>>>>>>> Stashed changes
