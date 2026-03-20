@@ -7,6 +7,7 @@ Docstrings have been added, as well as DDIM sampling and a new collection of bet
 """
 
 import enum
+import inspect
 import math
 
 import numpy as np
@@ -16,6 +17,26 @@ from copy import deepcopy
 from mdm_core.diffusion.nn import mean_flat, sum_flat
 from mdm_core.diffusion.losses import normal_kl, discretized_gaussian_log_likelihood
 from mdm_core.data_loaders.humanml.scripts import motion_process
+
+
+def _call_denoised_fn(denoised_fn, x, t, model_kwargs):
+    try:
+        signature = inspect.signature(denoised_fn)
+    except (TypeError, ValueError):
+        return denoised_fn(x, t=t, model_kwargs=model_kwargs)
+
+    params = signature.parameters
+    accepts_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+    )
+    if accepts_kwargs or "t" in params or "model_kwargs" in params:
+        kwargs = {}
+        if accepts_kwargs or "t" in params:
+            kwargs["t"] = t
+        if accepts_kwargs or "model_kwargs" in params:
+            kwargs["model_kwargs"] = model_kwargs
+        return denoised_fn(x, **kwargs)
+    return denoised_fn(x)
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
@@ -353,7 +374,7 @@ class GaussianDiffusion:
 
         def process_xstart(x):
             if denoised_fn is not None:
-                x = denoised_fn(x)
+                x = _call_denoised_fn(denoised_fn, x, t, model_kwargs)
             if clip_denoised:
                 # print('clip_denoised', clip_denoised)
                 return x.clamp(-1, 1)

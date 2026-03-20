@@ -13,10 +13,34 @@ from mdm_core.utils import dist_util
 from mdm_core.model.cfg_sampler import ClassifierFreeSampleModel
 from mdm_core.data_loaders.get_data import get_dataset_loader
 from mdm_core.data_loaders.humanml.scripts.motion_process import recover_from_ric
+from mdm_core.guidance import FootGroundGuidance, FootGroundGuidanceConfig
 import mdm_core.data_loaders.humanml.utils.paramUtil as paramUtil
 from mdm_core.data_loaders.humanml.utils.plot_script import plot_3d_motion
 import shutil
 from mdm_core.data_loaders.tensors import collate
+
+
+def create_foot_ground_guidance(args, data, model):
+    if not args.fg_guidance:
+        return None
+    if args.dataset != 'humanml' or model.data_rep != 'hml_vec':
+        raise NotImplementedError('Foot-ground guidance currently supports HumanML hml_vec sampling only.')
+
+    config = FootGroundGuidanceConfig(
+        last_steps=args.fg_last_steps,
+        tau=args.fg_tau,
+        contact_k=args.fg_contact_k,
+        lambda_pen=args.fg_lambda_pen,
+        lambda_float=args.fg_lambda_float,
+        lambda_skate=args.fg_lambda_skate,
+        step_size=args.fg_step_size,
+        grad_clip=args.fg_grad_clip,
+    )
+    return FootGroundGuidance(
+        mean=data.dataset.t2m_dataset.mean,
+        std=data.dataset.t2m_dataset.std,
+        config=config,
+    )
 
 
 def main():
@@ -37,6 +61,8 @@ def main():
             out_path += '_' + args.text_prompt.replace(' ', '_').replace('.', '')
         elif args.input_text != '':
             out_path += '_' + os.path.basename(args.input_text).replace('.txt', '').replace(' ', '_').replace('.', '')
+        if args.fg_guidance:
+            out_path += '_fg'
 
     # this block must be called BEFORE the dataset is loaded
     if args.text_prompt != '':
@@ -81,6 +107,9 @@ def main():
         model = ClassifierFreeSampleModel(model)   # wrapping model with the classifier-free sampler
     model.to(dist_util.dev())
     model.eval()  # disable random masking
+    foot_ground_guidance = create_foot_ground_guidance(args, data, model)
+    if foot_ground_guidance is not None:
+        print('Foot-ground guidance is enabled.')
 
     if is_using_data:
         iterator = iter(data)
@@ -123,6 +152,7 @@ def main():
             dump_steps=None,
             noise=None,
             const_noise=False,
+            denoised_fn=foot_ground_guidance,
         )
 
         # Recover XYZ *positions* from HumanML3D vector representation

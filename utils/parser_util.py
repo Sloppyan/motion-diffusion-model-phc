@@ -170,6 +170,24 @@ def add_generate_options(parser):
                        help="A text prompt to be generated. If empty, will take text prompts from dataset.")
     group.add_argument("--action_name", default='', type=str,
                        help="An action name to be generated. If empty, will take text prompts from dataset.")
+    group.add_argument("--fg_guidance", action='store_true',
+                       help="Enable foot-ground guidance during the last denoising steps.")
+    group.add_argument("--fg_last_steps", default=10, type=int,
+                       help="How many final denoising steps use foot-ground guidance.")
+    group.add_argument("--fg_tau", default=0.005, type=float,
+                       help="Ground-contact tolerance in meters.")
+    group.add_argument("--fg_contact_k", default=50.0, type=float,
+                       help="Sigmoid sharpness for soft foot contact.")
+    group.add_argument("--fg_lambda_pen", default=1.0, type=float,
+                       help="Penetration loss weight for foot-ground guidance on mm-scale losses.")
+    group.add_argument("--fg_lambda_float", default=1.0, type=float,
+                       help="Floating loss weight for foot-ground guidance on mm-scale losses.")
+    group.add_argument("--fg_lambda_skate", default=2.0, type=float,
+                       help="Skating loss weight for foot-ground guidance on mm-scale losses.")
+    group.add_argument("--fg_step_size", default=1e-4, type=float,
+                       help="Gradient step size applied to pred_xstart when guidance is active.")
+    group.add_argument("--fg_grad_clip", default=0.0, type=float,
+                       help="Optional per-sample gradient norm clip. Disable with 0.")
 
 
 def add_edit_options(parser):

@@ -9,6 +9,7 @@ _TOP_LEVEL_MODULES = (
     "data_loaders",
     "model",
     "diffusion",
+    "guidance",
     "sample",
     "mdm_talker",
 )
