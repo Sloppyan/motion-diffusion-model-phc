@@ -9,6 +9,23 @@ from mdm_core.data_loaders.humanml.utils.paramUtil import *
 import torch
 from tqdm import tqdm
 
+n_raw_offsets = torch.from_numpy(t2m_raw_offsets)
+kinematic_chain = t2m_kinematic_chain
+l_idx1, l_idx2 = 5, 8
+fid_r, fid_l = [8, 11], [7, 10]
+face_joint_indx = [2, 1, 17, 16]
+r_hip, l_hip = 2, 1
+joints_num = 22
+
+_example_motion_path = os.path.abspath(
+    pjoin(os.path.dirname(__file__), "../../../dataset/HumanML3D/new_joints/000021.npy")
+)
+example_data = np.load(_example_motion_path)
+example_data = example_data.reshape(len(example_data), -1, 3)
+example_data = torch.from_numpy(example_data)
+tgt_skel = Skeleton(n_raw_offsets, kinematic_chain, "cpu")
+tgt_offsets = tgt_skel.get_offsets_joints(example_data[0])
+
 # positions (batch, joint_num, 3)
 def uniform_skeleton(positions, target_offset):
     src_skel = Skeleton(n_raw_offsets, kinematic_chain, 'cpu')

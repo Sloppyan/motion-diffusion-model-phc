@@ -38,6 +38,19 @@ def _call_denoised_fn(denoised_fn, x, t, model_kwargs):
         return denoised_fn(x, **kwargs)
     return denoised_fn(x)
 
+
+def _apply_inpainting_projection(x, model_kwargs):
+    if model_kwargs is None or "y" not in model_kwargs:
+        return x
+    y = model_kwargs["y"]
+    if "inpainting_mask" not in y or "inpainted_motion" not in y:
+        return x
+
+    inpainting_mask = y["inpainting_mask"]
+    inpainted_motion = y["inpainted_motion"]
+    assert x.shape == inpainting_mask.shape == inpainted_motion.shape
+    return (x * ~inpainting_mask) + (inpainted_motion * inpainting_mask)
+
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
     Get a pre-defined beta schedule for the given name.
@@ -321,18 +334,17 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
 
+        x = _apply_inpainting_projection(x, model_kwargs)
         B, C = x.shape[:2]
         assert t.shape == (B,)
         model_output = model(x, self._scale_timesteps(t), **model_kwargs)
 
         if 'inpainting_mask' in model_kwargs['y'].keys() and 'inpainted_motion' in model_kwargs['y'].keys():
-            inpainting_mask, inpainted_motion = model_kwargs['y']['inpainting_mask'], model_kwargs['y']['inpainted_motion']
             assert self.model_mean_type == ModelMeanType.START_X, 'This feature supports only X_start pred for mow!'
-            assert model_output.shape == inpainting_mask.shape == inpainted_motion.shape
-            model_output = (model_output * ~inpainting_mask) + (inpainted_motion * inpainting_mask)
+            model_output = _apply_inpainting_projection(model_output, model_kwargs)
             # print('model_output', model_output.shape, model_output)
-            # print('inpainting_mask', inpainting_mask.shape, inpainting_mask[0,0,0,:])
-            # print('inpainted_motion', inpainted_motion.shape, inpainted_motion)
+            # print('inpainting_mask', model_kwargs['y']['inpainting_mask'].shape, model_kwargs['y']['inpainting_mask'][0,0,0,:])
+            # print('inpainted_motion', model_kwargs['y']['inpainted_motion'].shape, model_kwargs['y']['inpainted_motion'])
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
@@ -566,6 +578,7 @@ class GaussianDiffusion:
         # print('log_variance', out["log_variance"].shape, out["log_variance"])
         # print('nonzero_mask', nonzero_mask.shape, nonzero_mask)
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        sample = _apply_inpainting_projection(sample, model_kwargs)
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
 
     def p_sample_with_grad(
@@ -614,6 +627,7 @@ class GaussianDiffusion:
                     cond_fn, out, x, t, model_kwargs=model_kwargs
                 )
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        sample = _apply_inpainting_projection(sample, model_kwargs)
         return {"sample": sample, "pred_xstart": out["pred_xstart"].detach()}
 
     def p_sample_loop(
