@@ -138,11 +138,9 @@ class MDM(nn.Module):
             texts = clip.tokenize(raw_text, truncate=True).to(device) # [bs, context_length] # if n_tokens > 77 -> will truncate
         return self.clip_model.encode_text(texts).float()
 
-    def forward(self, x, timesteps, y=None):
-        """
-        x: [batch_size, njoints, nfeats, max_frames], denoted x_t in the paper
-        timesteps: [batch_size] (int)
-        """
+    def _forward_hidden(self, x, timesteps, y=None):
+        if y is None:
+            y = {}
         bs, njoints, nfeats, nframes = x.shape
         emb = self.embed_timestep(timesteps)  # [1, bs, d]
 
@@ -187,7 +185,27 @@ class MDM(nn.Module):
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen, bs, d]
             output, _ = self.gru(xseq)
 
-        output = self.output_process(output)  # [bs, njoints, nfeats, nframes]
+        return output
+
+    def forward_with_hidden(self, x, timesteps, y=None):
+        """
+        Return both the motion prediction and the per-frame latent features.
+
+        Hidden features are returned as [bs, frames, dim] so downstream RL code
+        can pool them without depending on the internal transformer layout.
+        """
+        hidden = self._forward_hidden(x, timesteps, y=y)
+        output = self.output_process(hidden)  # [bs, njoints, nfeats, nframes]
+        return output, hidden.permute(1, 0, 2).contiguous()
+
+    def forward(self, x, timesteps, y=None):
+        """
+        x: [batch_size, njoints, nfeats, max_frames], denoted x_t in the paper
+        timesteps: [batch_size] (int)
+        """
+        hidden = self._forward_hidden(x, timesteps, y=y)
+
+        output = self.output_process(hidden)  # [bs, njoints, nfeats, nframes]
         return output
 
 

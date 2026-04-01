@@ -31,3 +31,12 @@ class ClassifierFreeSampleModel(nn.Module):
         out_uncond = self.model(x, timesteps, y_uncond)
         return out_uncond + (y['scale'].view(-1, 1, 1, 1) * (out - out_uncond))
 
+    def forward_with_hidden(self, x, timesteps, y=None):
+        cond_mode = self.model.cond_mode
+        assert cond_mode in ['text', 'action']
+        y_uncond = deepcopy(y)
+        y_uncond['uncond'] = True
+        out, hidden = self.model.forward_with_hidden(x, timesteps, y)
+        out_uncond = self.model(x, timesteps, y_uncond)
+        guided = out_uncond + (y['scale'].view(-1, 1, 1, 1) * (out - out_uncond))
+        return guided, hidden

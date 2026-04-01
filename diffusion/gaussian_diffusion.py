@@ -39,17 +39,9 @@ def _call_denoised_fn(denoised_fn, x, t, model_kwargs):
     return denoised_fn(x)
 
 
-def _apply_inpainting_projection(x, model_kwargs):
-    if model_kwargs is None or "y" not in model_kwargs:
-        return x
-    y = model_kwargs["y"]
-    if "inpainting_mask" not in y or "inpainted_motion" not in y:
-        return x
-
-    inpainting_mask = y["inpainting_mask"]
-    inpainted_motion = y["inpainted_motion"]
-    assert x.shape == inpainting_mask.shape == inpainted_motion.shape
-    return (x * ~inpainting_mask) + (inpainted_motion * inpainting_mask)
+def _gaussian_log_prob(x, mean, log_variance):
+    log_two_pi = math.log(2.0 * math.pi)
+    return sum_flat(-0.5 * (log_two_pi + log_variance + ((x - mean) ** 2) * th.exp(-log_variance)))
 
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
@@ -334,17 +326,9 @@ class GaussianDiffusion:
         if model_kwargs is None:
             model_kwargs = {}
 
-        x = _apply_inpainting_projection(x, model_kwargs)
         B, C = x.shape[:2]
         assert t.shape == (B,)
         model_output = model(x, self._scale_timesteps(t), **model_kwargs)
-
-        if 'inpainting_mask' in model_kwargs['y'].keys() and 'inpainted_motion' in model_kwargs['y'].keys():
-            assert self.model_mean_type == ModelMeanType.START_X, 'This feature supports only X_start pred for mow!'
-            model_output = _apply_inpainting_projection(model_output, model_kwargs)
-            # print('model_output', model_output.shape, model_output)
-            # print('inpainting_mask', model_kwargs['y']['inpainting_mask'].shape, model_kwargs['y']['inpainting_mask'][0,0,0,:])
-            # print('inpainted_motion', model_kwargs['y']['inpainted_motion'].shape, model_kwargs['y']['inpainted_motion'])
 
         if self.model_var_type in [ModelVarType.LEARNED, ModelVarType.LEARNED_RANGE]:
             assert model_output.shape == (B, C * 2, *x.shape[2:])
@@ -554,12 +538,13 @@ class GaussianDiffusion:
                  - 'sample': a random sample from the model.
                  - 'pred_xstart': a prediction of x_0.
         """
-        out = self.p_mean_variance(
+        out = self._conditioned_p_mean_variance(
             model,
             x,
             t,
             clip_denoised=clip_denoised,
             denoised_fn=denoised_fn,
+            cond_fn=cond_fn,
             model_kwargs=model_kwargs,
         )
         noise = th.randn_like(x)
@@ -570,16 +555,102 @@ class GaussianDiffusion:
         nonzero_mask = (
             (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
         )  # no noise when t == 0
-        if cond_fn is not None:
-            out["mean"] = self.condition_mean(
-                cond_fn, out, x, t, model_kwargs=model_kwargs
-            )
         # print('mean', out["mean"].shape, out["mean"])
         # print('log_variance', out["log_variance"].shape, out["log_variance"])
         # print('nonzero_mask', nonzero_mask.shape, nonzero_mask)
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
-        sample = _apply_inpainting_projection(sample, model_kwargs)
         return {"sample": sample, "pred_xstart": out["pred_xstart"]}
+
+    def p_sample_with_logprob(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        const_noise=False,
+    ):
+        out = self._conditioned_p_mean_variance(
+            model,
+            x,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            cond_fn=cond_fn,
+            model_kwargs=model_kwargs,
+        )
+        noise = th.randn_like(x)
+        if const_noise:
+            noise = noise[[0]].repeat(x.shape[0], 1, 1, 1)
+
+        nonzero_mask = (t != 0).float().view(-1, *([1] * (len(x.shape) - 1)))
+        sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
+        logp = _gaussian_log_prob(sample, out["mean"], out["log_variance"])
+        return {
+            "sample": sample,
+            "pred_xstart": out["pred_xstart"],
+            "mean": out["mean"],
+            "log_variance": out["log_variance"],
+            "logp": logp,
+        }
+
+    def calc_action_logprob(
+        self,
+        model,
+        x_t,
+        x_prev,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+    ):
+        out = self._conditioned_p_mean_variance(
+            model,
+            x_t,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            cond_fn=cond_fn,
+            model_kwargs=model_kwargs,
+        )
+        logp = _gaussian_log_prob(x_prev, out["mean"], out["log_variance"])
+        return {
+            "logp": logp,
+            "mean": out["mean"],
+            "log_variance": out["log_variance"],
+            "pred_xstart": out["pred_xstart"],
+        }
+
+    def _conditioned_p_mean_variance(
+        self,
+        model,
+        x,
+        t,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+    ):
+        out = self.p_mean_variance(
+            model,
+            x,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            model_kwargs=model_kwargs,
+        )
+        if cond_fn is not None:
+            out["mean"] = self.condition_mean(
+                cond_fn,
+                out,
+                x,
+                t,
+                model_kwargs=model_kwargs,
+            )
+        return out
 
     def p_sample_with_grad(
         self,
@@ -627,7 +698,6 @@ class GaussianDiffusion:
                     cond_fn, out, x, t, model_kwargs=model_kwargs
                 )
         sample = out["mean"] + nonzero_mask * th.exp(0.5 * out["log_variance"]) * noise
-        sample = _apply_inpainting_projection(sample, model_kwargs)
         return {"sample": sample, "pred_xstart": out["pred_xstart"].detach()}
 
     def p_sample_loop(
@@ -698,6 +768,117 @@ class GaussianDiffusion:
         if dump_steps is not None:
             return dump
         return final["sample"]
+
+    def p_sample_loop_collect(
+        self,
+        model,
+        shape,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+        skip_timesteps=0,
+        init_image=None,
+        randomize_class=False,
+        const_noise=False,
+        store_cpu=True,
+        collect_hidden=False,
+    ):
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        if noise is not None:
+            img = noise
+        else:
+            img = th.randn(*shape, device=device)
+
+        if skip_timesteps and init_image is None:
+            init_image = th.zeros_like(img)
+
+        indices = list(range(self.num_timesteps - skip_timesteps))[::-1]
+        if init_image is not None:
+            my_t = th.ones([shape[0]], device=device, dtype=th.long) * indices[0]
+            img = self.q_sample(init_image, my_t, img)
+
+        if model_kwargs is None:
+            model_kwargs = {}
+        if "y" in model_kwargs and "text" in model_kwargs["y"] and "text_embed" not in model_kwargs["y"]:
+            model_kwargs["y"]["text_embed"] = model.encode_text(model_kwargs["y"]["text"])
+
+        if progress:
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+
+        trajectory = []
+        final = None
+        for i in indices:
+            t = th.tensor([i] * shape[0], device=device)
+            if randomize_class and "y" in model_kwargs:
+                model_kwargs["y"] = th.randint(
+                    low=0,
+                    high=model.num_classes,
+                    size=model_kwargs["y"].shape,
+                    device=model_kwargs["y"].device,
+                )
+            with th.no_grad():
+                out = self.p_sample_with_logprob(
+                    model,
+                    img,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    cond_fn=cond_fn,
+                    model_kwargs=model_kwargs,
+                    const_noise=const_noise,
+                )
+
+                hidden = None
+                if collect_hidden:
+                    # Critic features are extracted from the conditional actor
+                    # backbone at the current diffusion state x_t. We keep this
+                    # separate from the guided sampling path so the policy
+                    # logits stay unchanged while the critic gets a stable
+                    # sequence representation.
+                    forward_with_hidden = getattr(model, "forward_with_hidden", None)
+                    if forward_with_hidden is None and hasattr(model, "model"):
+                        forward_with_hidden = getattr(model.model, "forward_with_hidden", None)
+                    if forward_with_hidden is None:
+                        raise AttributeError("Model does not implement forward_with_hidden required for critic features.")
+
+                    _, hidden = forward_with_hidden(
+                        img,
+                        self._scale_timesteps(t),
+                        model_kwargs.get("y") if model_kwargs is not None else None,
+                    )
+            step = {
+                "x_t": img.detach(),
+                "x_prev": out["sample"].detach(),
+                "t": t.detach(),
+                "mean": out["mean"].detach(),
+                "log_variance": out["log_variance"].detach(),
+                "logp": out["logp"].detach(),
+                "pred_xstart": out["pred_xstart"].detach(),
+            }
+            if hidden is not None:
+                step["hidden"] = hidden.detach().to(dtype=th.float16)
+            if store_cpu:
+                step = {
+                    key: value.cpu() if th.is_tensor(value) else value
+                    for key, value in step.items()
+                }
+            trajectory.append(step)
+            img = out["sample"]
+            final = out
+
+        return {
+            "sample": final["sample"].detach().cpu() if store_cpu else final["sample"].detach(),
+            "pred_xstart": final["pred_xstart"].detach().cpu() if store_cpu else final["pred_xstart"].detach(),
+            "trajectory": trajectory,
+        }
 
     def p_sample_loop_progressive(
         self,
