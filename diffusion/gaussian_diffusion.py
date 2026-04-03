@@ -43,6 +43,32 @@ def _gaussian_log_prob(x, mean, log_variance):
     log_two_pi = math.log(2.0 * math.pi)
     return sum_flat(-0.5 * (log_two_pi + log_variance + ((x - mean) ** 2) * th.exp(-log_variance)))
 
+
+def _gaussian_log_prob_terms(x, mean, log_variance):
+    log_two_pi = math.log(2.0 * math.pi)
+    return -0.5 * (log_two_pi + log_variance + ((x - mean) ** 2) * th.exp(-log_variance))
+
+
+def _frame_gaussian_log_prob(x, mean, log_variance):
+    terms = _gaussian_log_prob_terms(x, mean, log_variance)
+    if terms.ndim < 4:
+        raise ValueError(f"Expected at least 4D motion tensor for frame logprob, got shape {tuple(terms.shape)}.")
+    reduce_dims = tuple(range(terms.ndim - 3, terms.ndim - 1))
+    return terms.sum(dim=reduce_dims)
+
+
+def _aggregate_frame_log_prob_chunks(frame_logp, chunk_frame_mask):
+    if chunk_frame_mask.dtype != th.bool:
+        chunk_frame_mask = chunk_frame_mask.bool()
+    chunk_frame_mask = chunk_frame_mask.to(device=frame_logp.device)
+    frame_logp = frame_logp.unsqueeze(-2)
+    return (frame_logp * chunk_frame_mask.float()).sum(dim=-1)
+
+
+def calc_chunk_log_prob_from_stats(x_prev, mean, log_variance, chunk_frame_mask):
+    frame_logp = _frame_gaussian_log_prob(x_prev, mean, log_variance)
+    return _aggregate_frame_log_prob_chunks(frame_logp, chunk_frame_mask)
+
 def get_named_beta_schedule(schedule_name, num_diffusion_timesteps, scale_betas=1.):
     """
     Get a pre-defined beta schedule for the given name.
@@ -619,6 +645,40 @@ class GaussianDiffusion:
         logp = _gaussian_log_prob(x_prev, out["mean"], out["log_variance"])
         return {
             "logp": logp,
+            "mean": out["mean"],
+            "log_variance": out["log_variance"],
+            "pred_xstart": out["pred_xstart"],
+        }
+
+    def calc_chunk_action_logprob(
+        self,
+        model,
+        x_t,
+        x_prev,
+        t,
+        chunk_frame_mask,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+    ):
+        out = self._conditioned_p_mean_variance(
+            model,
+            x_t,
+            t,
+            clip_denoised=clip_denoised,
+            denoised_fn=denoised_fn,
+            cond_fn=cond_fn,
+            model_kwargs=model_kwargs,
+        )
+        chunk_logp = calc_chunk_log_prob_from_stats(
+            x_prev=x_prev,
+            mean=out["mean"],
+            log_variance=out["log_variance"],
+            chunk_frame_mask=chunk_frame_mask,
+        )
+        return {
+            "chunk_logp": chunk_logp,
             "mean": out["mean"],
             "log_variance": out["log_variance"],
             "pred_xstart": out["pred_xstart"],

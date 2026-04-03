@@ -20,11 +20,12 @@ def summarize_rollout(rollout, reward_spec, prefix: str = "") -> Dict[str, float
     q10_reward_mean = float(np.mean([term.q10_reward for term in reward_terms])) if reward_terms else 0.0
     completion_mean = float(np.mean([term.completion for term in reward_terms])) if reward_terms else 0.0
     early_term_mean = float(np.mean([term.early_term for term in reward_terms])) if reward_terms else 0.0
-    return {
+    summary = {
         f"{prefix}reward_mean": reward_mean,
         f"{prefix}reward_loss": -reward_mean,
         f"{prefix}reward_std": reward_std,
         f"{prefix}reward_mode": reward_spec.mode,
+        f"{prefix}reward_assignment": reward_spec.assignment,
         f"{prefix}reward_component_return_mean": float(np.mean([info["return_mean_term"] for info in reward_infos])) if reward_infos else 0.0,
         f"{prefix}reward_component_q10": float(np.mean([info["q10_term"] for info in reward_infos])) if reward_infos else 0.0,
         f"{prefix}reward_component_early_term": float(np.mean([info["early_term_term"] for info in reward_infos])) if reward_infos else 0.0,
@@ -39,6 +40,18 @@ def summarize_rollout(rollout, reward_spec, prefix: str = "") -> Dict[str, float
         f"{prefix}completion_mean": completion_mean,
         f"{prefix}early_term_mean": early_term_mean,
     }
+    if getattr(rollout, "chunk_rewards", None) is not None:
+        valid = rollout.chunk_exec_mask.bool() if rollout.chunk_exec_mask is not None else None
+        if valid is not None and valid.any():
+            chunk_rewards = rollout.chunk_rewards.float()
+            summary[f"{prefix}chunk_reward_mean"] = float(chunk_rewards[valid].mean().item())
+            summary[f"{prefix}chunk_reward_std"] = float(chunk_rewards[valid].std(unbiased=False).item())
+            summary[f"{prefix}chunk_active_mean"] = float(valid.float().sum(dim=1).mean().item())
+        else:
+            summary[f"{prefix}chunk_reward_mean"] = 0.0
+            summary[f"{prefix}chunk_reward_std"] = 0.0
+            summary[f"{prefix}chunk_active_mean"] = 0.0
+    return summary
 
 
 def format_debug_entries(entries) -> str:

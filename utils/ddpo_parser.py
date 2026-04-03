@@ -64,6 +64,7 @@ def build_ddpo_parser() -> ArgumentParser:
     parser.add_argument("--kl_coef", default=0.0, type=float)
     parser.add_argument("--gae_gamma", default=0.99, type=float)
     parser.add_argument("--gae_lambda", default=0.95, type=float)
+    parser.add_argument("--ft_denoising_steps", default=0, type=int)
 
     parser.add_argument("--guidance_param", default=2.5, type=float)
     parser.add_argument("--max_motion_frames", default=196, type=int)
@@ -78,6 +79,16 @@ def build_ddpo_parser() -> ArgumentParser:
     parser.add_argument("--phc_max_steps", default=512, type=int)
 
     parser.add_argument("--reward_mode", default="refine", choices=["refine", "failure"], type=str)
+    parser.add_argument("--reward_assignment", default="sequence", choices=["sequence", "chunk"], type=str)
+    parser.add_argument("--reward_chunk_size", default=14, type=int)
+    parser.add_argument("--reward_chunk_reduce", default="mean", choices=["mean"], type=str)
+    parser.add_argument("--chunk_mean_weight", default=None, type=float)
+    parser.add_argument("--chunk_q10_weight", default=None, type=float)
+    parser.add_argument("--chunk_success_weight", default=None, type=float)
+    parser.add_argument("--chunk_fail_weight", default=None, type=float)
+    parser.add_argument("--chunk_fail_prev_weight", default=None, type=float)
+    parser.add_argument("--chunk_early_weight", default=None, type=float)
+    parser.add_argument("--chunk_early_prev_weight", default=None, type=float)
     parser.add_argument("--reward_fail_penalty", default=None, type=float)
     parser.add_argument("--reward_return_mean_weight", default=None, type=float)
     parser.add_argument("--reward_q10_weight", default=None, type=float)
@@ -146,6 +157,12 @@ def parse_ddpo_args(argv=None):
         args.guidance_param = 1.0
     if args.actor_num_epochs <= 0:
         args.actor_num_epochs = args.num_inner_epochs
+    if args.ft_denoising_steps < 0:
+        parser.error("--ft_denoising_steps must be non-negative.")
+    if args.reward_assignment == "chunk" and args.algo != "actor_critic":
+        parser.error("--reward_assignment=chunk currently requires --algo actor_critic.")
+    if args.reward_assignment == "chunk" and args.reward_chunk_size <= 0:
+        parser.error("--reward_chunk_size must be positive when --reward_assignment=chunk.")
     if args.train_sampling_mode != "uniform" and not args.failure_cases_file:
         parser.error("--failure_cases_file is required when --train_sampling_mode is not uniform.")
     if args.train_sampling_mode == "mixed":

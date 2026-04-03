@@ -13,11 +13,16 @@ from mdm_core.utils.model_util import create_model_and_diffusion, load_model_wo_
 
 from model.lora_attention import inject_lora_into_mdm, iter_lora_parameters, load_lora_state_dict, lora_state_dict, mark_only_lora_trainable
 from train.ddpo_rl.buffer import build_rollout_batch
-from train.ddpo_rl.reward import extract_episode_reward_terms, score_reward_terms
+from train.ddpo_rl.reward import (
+    build_chunk_frame_mask,
+    extract_chunk_reward_terms,
+    extract_episode_reward_terms,
+    score_reward_terms,
+)
 from train.phc_reward_runner import PHCRewardRunner
 from utils.mdm_phc_postprocess import HumanML3DPostprocessor
 
-from train.ddpo_rl.algorithms.common import build_sampling_model
+from train.ddpo_rl.algorithms.common import build_rollout_sampling_model
 
 
 def set_seed(seed: int):
@@ -84,12 +89,13 @@ def save_checkpoint(save_dir: Path, step: int, model, optimizer, algorithm_state
 
 
 class DDPORuntime:
-    def __init__(self, args, device, model, diffusion, reward_spec):
+    def __init__(self, args, device, model, diffusion, reward_spec, reference_model=None):
         self.args = args
         self.device = device
         self.model = model
         self.diffusion = diffusion
         self.reward_spec = reward_spec
+        self.reference_model = reference_model
         self.postprocessor = HumanML3DPostprocessor(model, data_root=args.data_root)
         self.reward_runner = PHCRewardRunner(
             config_path=args.phc_config_path,
@@ -134,7 +140,12 @@ class DDPORuntime:
         # PHC reference motions. Actor-critic optionally asks for hidden states
         # here, but the rollout path itself stays shared across algorithms.
         ##############################
-        sampling_model = build_sampling_model(model, args.guidance_param)
+        sampling_model = build_rollout_sampling_model(
+            model=model,
+            reference_model=self.reference_model,
+            guidance_param=args.guidance_param,
+            ft_denoising_steps=args.ft_denoising_steps,
+        )
         with torch.no_grad():
             if args.fixed_sampling_seed:
                 torch.manual_seed(args.seed)
@@ -183,6 +194,35 @@ class DDPORuntime:
             [score_reward_terms(term, self.reward_spec)[0] for term in reward_terms],
             dtype=torch.float32,
         )
+        chunk_ranges = None
+        chunk_frame_mask = None
+        chunk_exec_mask = None
+        chunk_frame_counts = None
+        chunk_weights = None
+        chunk_rewards = None
+        if self.reward_spec.assignment == "chunk":
+            ##############################################
+            # Chunk assignment keeps full-sequence sampling and PHC rollout
+            # unchanged, then derives chunk-local supervision from the same
+            # episode records and fixed time chunks.
+            ##############################################
+            chunk_terms = [extract_chunk_reward_terms(ep, self.reward_spec) for ep in episodes]
+            chunk_ranges, chunk_frame_mask_np, chunk_frame_counts_np = build_chunk_frame_mask(
+                lengths=lengths.detach().cpu().numpy(),
+                max_motion_frames=max_frames,
+                chunk_size=self.reward_spec.chunk_size,
+                chunk_count=self.reward_spec.chunk_count,
+            )
+            chunk_rewards_np = np.stack([term.chunk_reward for term in chunk_terms], axis=0).astype(np.float32)
+            chunk_exec_mask_np = np.stack([term.chunk_exec_mask for term in chunk_terms], axis=0).astype(bool)
+            chunk_weights_np = np.stack([term.chunk_weights for term in chunk_terms], axis=0).astype(np.float32)
+            chunk_ranges = list(chunk_ranges)
+            chunk_frame_mask = torch.from_numpy(chunk_frame_mask_np)
+            chunk_exec_mask = torch.from_numpy(chunk_exec_mask_np)
+            chunk_frame_counts = torch.from_numpy(chunk_frame_counts_np)
+            chunk_weights = torch.from_numpy(chunk_weights_np)
+            chunk_rewards = torch.from_numpy(chunk_rewards_np)
+
         return build_rollout_batch(
             texts=texts,
             tokens=tokens,
@@ -196,4 +236,10 @@ class DDPORuntime:
             trajectory=out["trajectory"],
             rewards=rewards,
             episodes=episodes,
+            chunk_ranges=chunk_ranges,
+            chunk_frame_mask=chunk_frame_mask,
+            chunk_exec_mask=chunk_exec_mask,
+            chunk_frame_counts=chunk_frame_counts,
+            chunk_weights=chunk_weights,
+            chunk_rewards=chunk_rewards,
         )

@@ -67,6 +67,9 @@ class ReinforceAlgorithm(RLAlgorithm):
             "ratio_mean": metrics["ratio_mean"],
             "entropy": metrics["entropy"],
             "reg_loss": metrics["reg_loss"],
+            "trainable_step_frac": metrics["trainable_step_frac"],
+            "trainable_t_min": metrics["trainable_t_min"],
+            "trainable_t_max": metrics["trainable_t_max"],
         }
 
     def debug_entries(self, rollout, limit: int) -> List[Dict]:

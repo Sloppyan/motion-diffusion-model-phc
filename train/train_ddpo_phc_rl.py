@@ -174,12 +174,19 @@ def main(argv=None):
     #######
     model, diffusion = load_policy(args, device, trainable=True)
     reference_model = None
-    if args.kl_coef > 0.0:
+    if args.kl_coef > 0.0 or args.ft_denoising_steps > 0:
         reference_model, _ = load_policy(args, device, trainable=False)
 
     trainable_params = list(iter_lora_parameters(model))
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
-    runtime = DDPORuntime(args=args, device=device, model=model, diffusion=diffusion, reward_spec=reward_spec)
+    runtime = DDPORuntime(
+        args=args,
+        device=device,
+        model=model,
+        diffusion=diffusion,
+        reward_spec=reward_spec,
+        reference_model=reference_model,
+    )
     algorithm = build_algorithm(
         args.algo,
         model=model,
@@ -282,11 +289,15 @@ def main(argv=None):
         run.finish()
 
 '''
+# small sample exp for raw-ppo
 python train/train_ddpo_phc_rl.py \
   --model_path /home/gxy/hay-thesis/motion-diffusion-model-phc/save/humanml_enc_512_50steps/model000750000.pt \
   --data_root /home/gxy/hay-thesis/HumanML3D/HumanML3D \
-  --run_name ddpo_phc_actor_critic_failure_only_0002 \
+  --run_name ddpo_phc_actor_critic_failure_only_0005_with_KL_1_ft_4 \
+  --ft_denoising_steps 4 \
   --algo actor_critic \
+  --kl_coef 1 \
+  --reward_assignment sequence \
   --reward_mode failure \
   --reward_success_weight 2.0 \
   --reward_fail_penalty 2.0 \
@@ -308,6 +319,83 @@ python train/train_ddpo_phc_rl.py \
   --phc_num_envs 16 \
   --phc_max_steps 300 \
   --num_outer_steps 200 \
+  --eval_interval 2 \
+  --eval_prompt_batch_size 4 \
+  --eval_split test \
+  --save_interval 10 \
+  --log_interval 1 \
+  --wandb_project mdm-phc-ddpo
+
+# small sample exp for chunk-level-ppo
+python train/train_ddpo_phc_rl.py \
+  --model_path /home/gxy/hay-thesis/motion-diffusion-model-phc/save/humanml_enc_512_50steps/model000750000.pt \
+  --data_root /home/gxy/hay-thesis/HumanML3D/HumanML3D \
+  --run_name ddpo_phc_actor_critic_failure_only_0006_chunk_level_with_KL_1 \
+  --algo actor_critic \
+  --kl_coef 1.0 \
+  --reward_mode failure \
+  --reward_success_weight 2.0 \
+  --reward_fail_penalty 2.0 \
+  --reward_assignment chunk \
+  --reward_chunk_size 14 \
+  --train_sampling_mode failure_only \
+  --failure_cases_file /home/gxy/hay-thesis/PHC/output/eval_mdm/mdm_eval_train_full/falling_cases.txt \
+  --failure_cases_split train \
+  --failure_eval_cases_file /home/gxy/hay-thesis/PHC/output/eval_mdm/mdm_eval_v7_full/falling_cases.txt \
+  --max_motion_frames 196 \
+  --prompt_batch_size 16 \
+  --ppo_minibatch_size 8 \
+  --critic_minibatch_size 128 \
+  --actor_num_epochs 1 \
+  --critic_num_epochs 2 \
+  --lr 3e-5 \
+  --critic_lr 3e-4 \
+  --clip_range 1e-2 \
+  --gae_gamma 0.99 \
+  --gae_lambda 0.95 \
+  --phc_num_envs 16 \
+  --phc_max_steps 300 \
+  --num_outer_steps 200 \
+  --eval_interval 2 \
+  --eval_prompt_batch_size 4 \
+  --eval_split test \
+  --save_interval 10 \
+  --log_interval 1 \
+  --wandb_project mdm-phc-ddpo
+
+  # real chunk level reward
+  python train/train_ddpo_phc_rl.py \
+    --chunk_early_weight 0 \
+  --chunk_early_prev_weight 0 \
+  --ft_denoising_steps 4 \
+  --model_path /home/gxy/hay-thesis/motion-diffusion-model-phc/save/humanml_enc_512_50steps/model000750000.pt \
+  --data_root /home/gxy/hay-thesis/HumanML3D/HumanML3D \
+  --run_name ddpo_phc_actor_critic_failure_only_00013_chunk_reward_with_KL_0.001_only_base_reward_k_steps_4 \
+  --algo actor_critic \
+  --kl_coef 0.001 \
+  --reward_mode failure \
+  --reward_assignment chunk \
+  --reward_chunk_size 14 \
+  --chunk_mean_weight 20.0 \
+  --chunk_q10_weight 8.0 \
+  --train_sampling_mode failure_only \
+  --failure_cases_file /home/gxy/hay-thesis/PHC/output/eval_mdm/mdm_eval_train_full/falling_cases.txt \
+  --failure_cases_split train \
+  --failure_eval_cases_file /home/gxy/hay-thesis/PHC/output/eval_mdm/mdm_eval_v7_full/falling_cases.txt \
+  --max_motion_frames 196 \
+  --prompt_batch_size 16 \
+  --ppo_minibatch_size 8 \
+  --critic_minibatch_size 128 \
+  --actor_num_epochs 1 \
+  --critic_num_epochs 2 \
+  --lr 3e-5 \
+  --critic_lr 3e-4 \
+  --clip_range 2e-2 \
+  --gae_gamma 0.99 \
+  --gae_lambda 0.95 \
+  --phc_num_envs 16 \
+  --phc_max_steps 300 \
+  --num_outer_steps 280 \
   --eval_interval 2 \
   --eval_prompt_batch_size 4 \
   --eval_split test \
