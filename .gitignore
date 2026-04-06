@@ -132,8 +132,6 @@ dmypy.json
 .pyre/
 
 save/
-<<<<<<< Updated upstream
-=======
 ._t2m
 .envrc
 t2m/
@@ -142,4 +140,7 @@ docs/
 dataset/HumanML3D/
 body_models/
 visualize/output
->>>>>>> Stashed changes
+data/
+data-failure/
+eval/
+wandb/
