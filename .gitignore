@@ -132,3 +132,15 @@ dmypy.json
 .pyre/
 
 save/
+._t2m
+t2m/
+glove/
+docs/
+dataset/HumanML3D/
+body_models/
+.envrc
+visualize/output
+data/
+data-failure
+eval/tracking/output
+wandb/
