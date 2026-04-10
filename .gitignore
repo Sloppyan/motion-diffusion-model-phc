@@ -140,3 +140,8 @@ dataset/HumanML3D/
 body_models/
 .envrc
 visualize/output
+data/
+data-failure
+eval/
+output/
+wandb/
