@@ -1,10 +1,9 @@
 import argparse
 import json
-import os
 import random
 import sys
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, Optional, Sequence
 
 try:  # Isaac Gym must be imported before torch in this process.
     import isaacgym  # noqa: F401
@@ -13,7 +12,6 @@ except ImportError:
 
 import numpy as np
 import torch
-import torch.nn as nn
 from torch.optim import AdamW
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,8 +26,8 @@ from train.dppo_frame_rl.data import (
 )
 from train.dppo_frame_rl.logging import merge_metrics
 from train.dppo_frame_rl.models.frame_critic import FrameCritic
-from train.dppo_frame_rl.runtime import FrameDPPORuntime
-from model.lora_attention import lora_state_dict
+from train.dsppo_rl import DSPPORuntime, FrameNoisePolicy
+from train.dsppo_rl.ppo import compute_noise_policy_loss
 
 try:
     import wandb
@@ -60,27 +58,24 @@ def parse_args():
     parser.add_argument("--critic_min_lr", default=0.0, type=float)
     parser.add_argument("--weight_decay", default=0.0, type=float)
     parser.add_argument("--clip_range", default=1e-2, type=float)
-    parser.add_argument("--clip_range_schedule", default="constant", choices=["constant", "exponential"], type=str)
-    parser.add_argument("--clip_range_base", default=None, type=float)
-    parser.add_argument("--clip_range_rate", default=3.0, type=float)
-    parser.add_argument("--kl_coef", default=0.0, type=float)
     parser.add_argument("--max_grad_norm", default=1.0, type=float)
 
     parser.add_argument("--guidance_param", default=2.5, type=float)
-    parser.add_argument("--ft_denoising_steps", default=0, type=int)
-    parser.add_argument("--gamma_denoising", default=0.995, type=float)
-    parser.add_argument("--min_sampling_denoising_std", default=1e-2, type=float)
-    parser.add_argument("--min_logprob_denoising_std", default=1e-2, type=float)
-    parser.add_argument("--lora_rank", default=8, type=int)
-    parser.add_argument("--lora_alpha", default=16.0, type=float)
-    parser.add_argument("--lora_layer_scope", default="all", choices=["all", "last3"], type=str)
-    parser.add_argument("--resume_lora_path", default="", type=str)
+    parser.add_argument("--noise_hidden_dim", default=256, type=int)
+    parser.add_argument("--noise_prior_kl_coef", default=0.0, type=float)
+    parser.add_argument("--noise_log_std_init", default=0.0, type=float)
+    parser.add_argument("--deterministic_denoising", action="store_true")
+    parser.add_argument("--deterministic_eval_policy", action="store_true")
 
     parser.add_argument("--frame_gamma", default=0.995, type=float)
     parser.add_argument("--frame_lambda", default=0.95, type=float)
     parser.add_argument("--adv_norm_std_only", action="store_true")
     parser.add_argument("--dense_reward_weight", default=1.0, type=float)
     parser.add_argument("--dense_reward_norm", action="store_true")
+    parser.add_argument("--pose_reward_weight", default=0.0, type=float)
+    parser.add_argument("--pose_reward_alpha", default=1.0, type=float)
+    parser.add_argument("--velocity_reward_weight", default=0.0, type=float)
+    parser.add_argument("--velocity_reward_alpha", default=1.0, type=float)
     parser.add_argument("--success_bonus", default=0.0, type=float)
     parser.add_argument("--fail_penalty", default=-5.0, type=float)
     parser.add_argument("--value_target_norm", default="none", choices=["none", "popart"], type=str)
@@ -110,7 +105,7 @@ def parse_args():
     parser.add_argument("--save_interval", default=10, type=int)
     parser.add_argument("--log_interval", default=1, type=int)
     parser.add_argument("--wandb_mode", default="disabled", choices=["disabled", "offline", "online"], type=str)
-    parser.add_argument("--wandb_project", default="mdm-phc-dppo-frame", type=str)
+    parser.add_argument("--wandb_project", default="mdm-phc-dsppo", type=str)
     return parser.parse_args()
 
 
@@ -166,13 +161,7 @@ def _cosine_decay(step: int, total_steps: int, max_lr: float, min_lr: float) -> 
     return float(min_lr + (max_lr - min_lr) * cosine)
 
 
-def resolve_scheduled_lr(
-    schedule: str,
-    step: int,
-    total_steps: int,
-    base_lr: float,
-    min_lr: float,
-) -> float:
+def resolve_scheduled_lr(schedule: str, step: int, total_steps: int, base_lr: float, min_lr: float) -> float:
     if schedule == "constant":
         return float(base_lr)
     return _cosine_decay(step=step, total_steps=total_steps, max_lr=base_lr, min_lr=min_lr)
@@ -184,19 +173,12 @@ def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
 
 
 def train_critic(args, critic, optimizer, rollout) -> Dict[str, float]:
-    metrics = {
-        "value_loss": 0.0,
-    }
+    metrics = {"value_loss": 0.0}
     if getattr(critic, "popart_enabled", False):
-        metrics.update(
-            {
-                "popart_mu": 0.0,
-            }
-        )
+        metrics.update({"popart_mu": 0.0})
     num_updates = 0
 
     if getattr(critic, "popart_enabled", False):
-        # Update running target statistics once per rollout.
         popart_stats = critic.update_popart_stats(rollout.frame_returns, rollout.frame_exec_mask)
         metrics["popart_mu"] = float(popart_stats.get("popart_mu", 0.0))
 
@@ -206,19 +188,11 @@ def train_critic(args, critic, optimizer, rollout) -> Dict[str, float]:
             mask = rollout.frame_exec_mask[batch_inds]
 
             if getattr(critic, "popart_enabled", False):
-                # Regress in normalized value space but keep raw-value metrics for logging.
-                pred_norm = critic(
-                    rollout.frame_features[batch_inds],
-                    rollout.text_embeds[batch_inds],
-                    normalized=True,
-                )
-                pred = critic.denormalize_values(pred_norm)
+                pred_norm = critic(rollout.frame_features[batch_inds], rollout.text_embeds[batch_inds], normalized=True)
                 target_norm = critic.normalize_targets(target)
                 loss = masked_value_loss(pred_norm, target_norm, mask)
             else:
                 pred = critic(rollout.frame_features[batch_inds], rollout.text_embeds[batch_inds])
-                pred_norm = pred
-                target_norm = target
                 loss = masked_value_loss(pred, target, mask)
 
             optimizer.zero_grad()
@@ -235,43 +209,40 @@ def train_critic(args, critic, optimizer, rollout) -> Dict[str, float]:
         return metrics
     averaged = {}
     for key, value in metrics.items():
-        if key in {"popart_mu"} and getattr(critic, "popart_enabled", False):
+        if key == "popart_mu" and getattr(critic, "popart_enabled", False):
             averaged[key] = value
         else:
             averaged[key] = value / num_updates
     return averaged
 
 
-def train_actor(args, runtime: FrameDPPORuntime, actor_optimizer, rollout) -> Dict[str, float]:
+def train_actor(args, noise_policy, actor_optimizer, rollout) -> Dict[str, float]:
     metrics: Dict[str, float] = {}
     num_updates = 0
 
     for _ in range(args.actor_num_epochs):
-        for batch_inds in iter_sample_minibatches(len(rollout.texts), args.ppo_minibatch_size, rollout.frame_features.device):
-            batch_texts = [rollout.texts[idx] for idx in batch_inds.tolist()]
-            loss_dict = runtime.policy.loss(
-                texts=batch_texts,
+        for batch_inds in iter_sample_minibatches(len(rollout.texts), args.ppo_minibatch_size, rollout.frame_noise.device):
+            loss_dict = compute_noise_policy_loss(
+                noise_policy=noise_policy,
                 text_embeds=rollout.text_embeds[batch_inds],
-                lengths_20fps=rollout.lengths_20fps[batch_inds],
-                chain_prev=rollout.chain_prev[batch_inds],
-                chain_next=rollout.chain_next[batch_inds],
-                timesteps=rollout.timesteps[batch_inds],
+                frame_noise=rollout.frame_noise[batch_inds],
+                frame_logprobs_old=rollout.frame_logprobs_old[batch_inds],
                 frame_advantages=rollout.frame_advantages[batch_inds],
                 frame_exec_mask=rollout.frame_exec_mask[batch_inds],
-                frame_logprobs_old=rollout.frame_logprobs_old[batch_inds],
+                clip_range=args.clip_range,
+                noise_prior_kl_coef=args.noise_prior_kl_coef,
             )
 
             actor_optimizer.zero_grad()
             loss_dict["loss"].backward()
             if args.max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(list(runtime.policy.trainable_parameters()), args.max_grad_norm)
+                torch.nn.utils.clip_grad_norm_(noise_policy.parameters(), args.max_grad_norm)
             actor_optimizer.step()
 
             with torch.no_grad():
                 for key, value in loss_dict.items():
-                    if key == "loss":
-                        continue
-                    metrics[key] = metrics.get(key, 0.0) + float(value.item())
+                    metric_key = "total_loss" if key == "loss" else key
+                    metrics[metric_key] = metrics.get(metric_key, 0.0) + float(value.item())
                 num_updates += 1
 
     if num_updates == 0:
@@ -283,7 +254,7 @@ def save_checkpoint(
     save_dir: Path,
     filename: str,
     step: int,
-    runtime: FrameDPPORuntime,
+    noise_policy,
     critic,
     actor_optimizer,
     critic_optimizer,
@@ -292,7 +263,7 @@ def save_checkpoint(
     save_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "step": step,
-        "actor_lora": lora_state_dict(runtime.policy.actor, bank_name="ft"),
+        "noise_policy": noise_policy.state_dict(),
         "critic": critic.state_dict(),
         "actor_optimizer": actor_optimizer.state_dict(),
         "critic_optimizer": critic_optimizer.state_dict(),
@@ -353,35 +324,36 @@ def main():
             failure_cases_file=args.failure_eval_cases_file,
         )
 
-    runtime = FrameDPPORuntime(args)
+    runtime = DSPPORuntime(args)
+    noise_policy = FrameNoisePolicy(
+        text_dim=runtime.actor.clip_dim,
+        hidden_dim=args.noise_hidden_dim,
+        action_dim=runtime.actor.njoints * runtime.actor.nfeats,
+        max_frames=args.max_motion_frames,
+        log_std_init=args.noise_log_std_init,
+    ).to(runtime.device)
     critic = FrameCritic(
         max_frames=args.max_motion_frames,
         value_target_norm=args.value_target_norm,
         popart_beta=args.popart_beta,
         popart_epsilon=args.popart_epsilon,
     ).to(runtime.device)
-    actor_optimizer = AdamW(list(runtime.policy.trainable_parameters()), lr=args.lr, weight_decay=args.weight_decay)
+
+    actor_optimizer = AdamW(noise_policy.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     critic_optimizer = AdamW(critic.parameters(), lr=args.critic_lr, weight_decay=args.weight_decay)
     wandb_run = maybe_init_wandb(args)
 
     rng = random.Random(args.seed)
     best_eval_score = float("-inf")
-    best_eval_name: Optional[str] = None
     try:
         for outer_step in range(1, args.num_outer_steps + 1):
-            actor_lr = resolve_scheduled_lr(
-                schedule=args.lr_schedule,
-                step=outer_step,
-                total_steps=args.num_outer_steps,
-                base_lr=args.lr,
-                min_lr=args.min_lr,
-            )
+            actor_lr = resolve_scheduled_lr(args.lr_schedule, outer_step, args.num_outer_steps, args.lr, args.min_lr)
             critic_lr = resolve_scheduled_lr(
-                schedule=args.critic_lr_schedule,
-                step=outer_step,
-                total_steps=args.num_outer_steps,
-                base_lr=args.critic_lr,
-                min_lr=args.critic_min_lr,
+                args.critic_lr_schedule,
+                outer_step,
+                args.num_outer_steps,
+                args.critic_lr,
+                args.critic_min_lr,
             )
             set_optimizer_lr(actor_optimizer, actor_lr)
             set_optimizer_lr(critic_optimizer, critic_lr)
@@ -396,8 +368,9 @@ def main():
             )
             rollout, rollout_metrics = runtime.collect_rollout(
                 entries=batch_entries,
+                noise_policy=noise_policy,
                 critic=critic,
-                deterministic=False,
+                policy_deterministic=False,
                 sampling_seed=args.seed if args.fixed_sampling_seed else None,
             )
 
@@ -416,10 +389,11 @@ def main():
             )
 
             critic_metrics = train_critic(args, critic, critic_optimizer, rollout)
-            actor_metrics = train_actor(args, runtime, actor_optimizer, rollout)
-            metrics = merge_metrics(rollout_metrics, critic_metrics, actor_metrics)
+            actor_metrics = train_actor(args, noise_policy, actor_optimizer, rollout)
             metrics = merge_metrics(
-                metrics,
+                rollout_metrics,
+                critic_metrics,
+                actor_metrics,
                 {
                     "actor_lr": actor_lr,
                     "critic_lr": critic_lr,
@@ -428,10 +402,7 @@ def main():
             train_metrics = prefix_metrics("train/", metrics)
 
             if outer_step % args.log_interval == 0:
-                print(
-                    f"[train] step={outer_step} "
-                    + " ".join(f"{k}={v:.4f}" for k, v in sorted(train_metrics.items()))
-                )
+                print(f"[train] step={outer_step} " + " ".join(f"{k}={v:.4f}" for k, v in sorted(train_metrics.items())))
             if wandb_run is not None:
                 wandb.log({**train_metrics, "outer_step": outer_step}, step=outer_step)
 
@@ -441,7 +412,8 @@ def main():
                     "eval/",
                     runtime.evaluate_entries(
                         entries=eval_batch,
-                        deterministic=False,
+                        noise_policy=noise_policy,
+                        policy_deterministic=args.deterministic_eval_policy,
                         sampling_seed=args.seed if args.fixed_sampling_seed else None,
                     ),
                 )
@@ -453,7 +425,8 @@ def main():
                         "eval_failure/",
                         runtime.evaluate_entries(
                             entries=failure_batch,
-                            deterministic=False,
+                            noise_policy=noise_policy,
+                            policy_deterministic=args.deterministic_eval_policy,
                             sampling_seed=args.seed if args.fixed_sampling_seed else None,
                         ),
                     )
@@ -465,28 +438,27 @@ def main():
 
                 best_metric = select_best_metric(merged_eval)
                 if best_metric is not None:
-                    metric_name, metric_value = best_metric
+                    _, metric_value = best_metric
                     if metric_value > best_eval_score:
                         best_eval_score = metric_value
-                        best_eval_name = metric_name
                         save_checkpoint(
                             save_dir=save_dir,
-                            filename="best_lora.pt",
+                            filename="best.pt",
                             step=outer_step,
-                            runtime=runtime,
+                            noise_policy=noise_policy,
                             critic=critic,
                             actor_optimizer=actor_optimizer,
                             critic_optimizer=critic_optimizer,
                             args=args,
                         )
-                        print(f"[checkpoint] step={outer_step} saved best_lora.pt ({metric_name}={metric_value:.4f})")
+                        print(f"[checkpoint] step={outer_step} saved best.pt")
 
             if outer_step % args.save_interval == 0 or outer_step == args.num_outer_steps:
                 save_checkpoint(
                     save_dir=save_dir,
-                    filename="latest_lora.pt",
+                    filename="latest.pt",
                     step=outer_step,
-                    runtime=runtime,
+                    noise_policy=noise_policy,
                     critic=critic,
                     actor_optimizer=actor_optimizer,
                     critic_optimizer=critic_optimizer,
@@ -498,166 +470,54 @@ def main():
             wandb.finish()
 
 '''
-python train/train_dppo_frame_phc.py \
+python train/train_dsppo_phc.py \
   --model_path /home/gxy/hay-thesis/motion-diffusion-model-phc/save/humanml_enc_512_50steps/model000750000.pt \
   --data_root /home/gxy/hay-thesis/HumanML3D/HumanML3D \
-  --run_name dppo_frame_failure_only_00016_onlyfailure \
+  --run_name dsppo_data_failure_0029_vel\
   --train_split train \
   --eval_split test \
   --train_sampling_mode failure_only \
   --failure_cases_file /home/gxy/hay-thesis/PHC/output/eval_mdm/mdm_eval_train_full/falling_cases.txt \
   --failure_eval_cases_file /home/gxy/hay-thesis/PHC/output/eval_mdm/mdm_eval_v7_full/falling_cases.txt \
-  --phc_actor_ckpt /home/gxy/hay-thesis/PHC/output/HumanoidIm/phc_kp_mcp_iccv/Humanoid.pth \
-  --dense_reward_weight 0 \
-  --fail_penalty -90.0 \
   --max_motion_frames 196 \
-  --prompt_batch_size 32 \
-  --ppo_minibatch_size 8 \
-  --critic_minibatch_size 32 \
+  --prompt_batch_size 256 \
+  --ppo_minibatch_size 256 \
+  --critic_minibatch_size 256 \
   --actor_num_epochs 2 \
   --critic_num_epochs 2 \
-  --lr 1e-4 \
+  --noise_prior_kl_coef 0.001 \
+  --pose_reward_weight 1.0 \
+  --pose_reward_alpha 0.5 \
   --lr_schedule cosine \
+  --lr 1e-4 \
   --min_lr 1e-5 \
-  --critic_lr 3e-4 \
   --critic_lr_schedule cosine \
+  --critic_lr 1e-4 \
   --critic_min_lr 1e-6 \
-  --clip_range 5e-2 \
-  --phc_num_envs 32 \
-  --phc_max_steps 420 \
-  --num_outer_steps 200 \
-  --ft_denoising_steps 4 \
+  --clip_range 2e-1 \
+  --guidance_param 2.5 \
+  --noise_hidden_dim 256 \
+  --noise_log_std_init -0.0 \
   --value_target_norm popart \
   --popart_beta 0.005 \
   --popart_epsilon 1e-5 \
-  --eval_interval 10 \
-  --eval_prompt_batch_size 16 \
-  --save_interval 10 \
-  --log_interval 1 \
-  --fixed_sampling_seed \
-  --wandb_project mdm-phc-dppo-frame \
-  --wandb_mode online
-
-  #small sample debugging
-  python train/train_dppo_frame_phc.py \
-  --model_path /home/gxy/hay-thesis/motion-diffusion-model-phc/save/humanml_enc_512_50steps/model000750000.pt \
-  --data_root /home/gxy/hay-thesis/motion-diffusion-model-phc/data-failure \
-  --run_name dppo_frame_data_failure_00021_debug \
-  --train_split train \
-  --eval_split test \
-  --train_sampling_mode uniform \
-  --phc_actor_ckpt /home/gxy/hay-thesis/PHC/output/HumanoidIm/phc_kp_mcp_iccv/Humanoid.pth \
-  --max_motion_frames 196 \
-  --prompt_batch_size 32 \
-  --ppo_minibatch_size 8 \
-  --critic_minibatch_size 32 \
-  --actor_num_epochs 1 \
-  --critic_num_epochs 2 \
-  --lr 5e-4 \
-  --lr_schedule cosine \
-  --min_lr 1e-5 \
-  --critic_lr 1e-4 \
-  --critic_lr_schedule cosine \
-  --critic_min_lr 1e-6 \
-  --clip_range 1e-1 \
-  --phc_num_envs 32 \
-  --phc_max_steps 420 \
-  --num_outer_steps 200 \
-  --ft_denoising_steps 4 \
-  --value_target_norm popart \
-  --popart_beta 0.005 \
-  --popart_epsilon 1e-5 \
-  --eval_interval 5 \
-  --eval_prompt_batch_size 1 \
-  --save_interval 10 \
-  --log_interval 1 \
-  --fixed_sampling_seed \
-  --wandb_project mdm-phc-dppo-frame \
-  --wandb_mode online \
-  --dense_reward_norm \
-  --fail_penalty -9.0
-
-  # normal big batch
-  python train/train_dppo_frame_phc.py \
-  --model_path /home/gxy/hay-thesis/motion-diffusion-model-phc/save/humanml_enc_512_50steps/model000750000.pt \
-  --data_root /home/gxy/hay-thesis/HumanML3D/HumanML3D \
-  --run_name dppo_frame_failure_only_00022_lr_clipran \
-  --train_split train \
-  --eval_split test \
-  --train_sampling_mode failure_only \
-  --failure_cases_file /home/gxy/hay-thesis/PHC/output/eval_mdm/mdm_eval_train_full/falling_cases.txt \
-  --failure_eval_cases_file /home/gxy/hay-thesis/PHC/output/eval_mdm/mdm_eval_v7_full/falling_cases.txt \
-  --phc_actor_ckpt /home/gxy/hay-thesis/PHC/output/HumanoidIm/phc_kp_mcp_iccv/Humanoid.pth \
-  --max_motion_frames 196 \
-  --prompt_batch_size 256 \
-  --ppo_minibatch_size 64 \
-  --critic_minibatch_size 128 \
-  --actor_num_epochs 1 \
-  --critic_num_epochs 2 \
-  --lr 1e-4 \
-  --lr_schedule cosine \
-  --min_lr 1e-5 \
-  --critic_lr 1e-4 \
-  --critic_lr_schedule cosine \
-  --critic_min_lr 1e-6 \
-  --clip_range 5e-2 \
   --phc_num_envs 256 \
-  --phc_max_steps 420 \
-  --num_outer_steps 300 \
-  --ft_denoising_steps 4 \
-  --value_target_norm popart \
-  --popart_beta 0.005 \
-  --popart_epsilon 1e-5 \
+  --phc_max_steps 400 \
+  --num_outer_steps 100 \
   --eval_interval 10 \
-  --eval_prompt_batch_size 128 \
+  --eval_prompt_batch_size 256 \
+  --save_root /home/gxy/hay-thesis/motion-diffusion-model-phc/save \
   --save_interval 10 \
-  --log_interval 1 \
-  --fixed_sampling_seed \
-  --wandb_project mdm-phc-dppo-frame \
+  --log_interval 5 \
   --wandb_mode online \
-  --dense_reward_norm \
-  --fail_penalty -9.0
-
-  # finetune LoRA
-  python train/train_dppo_frame_phc.py \
-  --model_path /home/gxy/hay-thesis/motion-diffusion-model-phc/save/stage2_repa/stage2_repa_run_002/best_model.pt \
-  --data_root /home/gxy/hay-thesis/HumanML3D/HumanML3D \
-  --run_name dppo_frame_failure_only_stage2_repa_0001 \
-  --train_split train \
-  --eval_split test \
-  --train_sampling_mode failure_only \
-  --failure_cases_file /home/gxy/hay-thesis/PHC/output/eval_mdm/mdm_eval_train_full/falling_cases.txt \
-  --failure_eval_cases_file /home/gxy/hay-thesis/PHC/output/eval_mdm/mdm_eval_v7_full/falling_cases.txt \
-  --phc_actor_ckpt /home/gxy/hay-thesis/PHC/output/HumanoidIm/phc_kp_mcp_iccv/Humanoid.pth \
-  --max_motion_frames 196 \
-  --prompt_batch_size 256 \
-  --ppo_minibatch_size 64 \
-  --critic_minibatch_size 128 \
-  --actor_num_epochs 1 \
-  --critic_num_epochs 2 \
-  --lr 1e-4 \
-  --lr_schedule cosine \
-  --min_lr 1e-5 \
-  --critic_lr 1e-4 \
-  --critic_lr_schedule cosine \
-  --critic_min_lr 1e-6 \
-  --clip_range 1e-1 \
-  --phc_num_envs 256 \
-  --phc_max_steps 420 \
-  --num_outer_steps 200 \
-  --ft_denoising_steps 4 \
-  --value_target_norm popart \
-  --popart_beta 0.005 \
-  --popart_epsilon 1e-5 \
-  --eval_interval 10 \
-  --eval_prompt_batch_size 128 \
-  --save_interval 10 \
-  --log_interval 1 \
   --fixed_sampling_seed \
-  --wandb_project mdm-phc-dppo-frame \
-  --wandb_mode online \
+  --deterministic_denoising \
+  --deterministic_eval_policy \
+  --fail_penalty -0.2 \
   --dense_reward_norm \
-  --fail_penalty -5.0
+  --dense_reward_weight 1.0 \
+  --velocity_reward_weight 0.1 \
+  --velocity_reward_alpha 0.5
 '''
 if __name__ == "__main__":
     main()

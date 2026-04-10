@@ -26,6 +26,7 @@ def summarize_episodes(episodes) -> Dict[str, float]:
             "success_rate": 0.0,
             "phc_return_mean": 0.0,
             "exec_ratio_mean": 0.0,
+            "generated_to_gt_len_ratio_mean": 0.0,
         }
     reward_means = np.asarray([float(ep.get("return_mean", 0.0)) for ep in episodes], dtype=np.float32)
     exec_ratio = np.asarray(
@@ -35,9 +36,17 @@ def summarize_episodes(episodes) -> Dict[str, float]:
         ],
         dtype=np.float32,
     )
+    generated_to_gt_len_ratio = np.asarray(
+        [
+            float(ep.get("length", 0)) / max(1.0, float(ep.get("gt_len_20fps", ep.get("length", 1))))
+            for ep in episodes
+        ],
+        dtype=np.float32,
+    )
     successes = np.asarray([bool(ep.get("success", False)) for ep in episodes], dtype=np.float32)
     return {
         "success_rate": float(successes.mean()),
         "phc_return_mean": float(reward_means.mean()),
         "exec_ratio_mean": float(exec_ratio.mean()),
+        "generated_to_gt_len_ratio_mean": float(generated_to_gt_len_ratio.mean()),
     }

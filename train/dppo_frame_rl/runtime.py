@@ -225,6 +225,11 @@ class FrameDPPORuntime:
         metrics = merge_metrics(
             summarize_episodes(episodes),
             {
+                "dense_reward_mean": reward_batch.dense_reward_mean,
+                "imitation_pose_reward_mean": reward_batch.imitation_pose_reward_mean,
+                "imitation_velocity_reward_mean": reward_batch.imitation_velocity_reward_mean,
+                "terminal_reward_mean": reward_batch.terminal_reward_mean,
+                "failure_penalty_mean": reward_batch.failure_penalty_mean,
                 "undiscounted_sequence_reward_mean": reward_batch.undiscounted_sequence_reward_mean,
                 "exec_ratio_mean": reward_batch.exec_ratio_mean,
             },

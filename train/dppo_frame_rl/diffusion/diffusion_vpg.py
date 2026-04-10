@@ -163,6 +163,7 @@ class FrameVPGDiffusion:
         lengths_20fps: torch.Tensor,
         max_motion_frames: int,
         deterministic: bool = False,
+        initial_noise: Optional[torch.Tensor] = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size = len(texts)
         shape = (
@@ -172,7 +173,19 @@ class FrameVPGDiffusion:
             max_motion_frames,
         )
         model_kwargs = self._build_model_kwargs(texts, lengths_20fps, max_motion_frames)
-        x_t = torch.randn(shape, device=self.device)
+        ##############################################
+        # Allow diagnostic scripts to replay sampling from a fixed x_T.
+        # Training keeps the default path and does not pass initial_noise.
+        ##############################################
+        if initial_noise is None:
+            initial_noise_t = torch.randn(shape, device=self.device)
+        else:
+            initial_noise_t = initial_noise.detach().clone().to(self.device)
+            if tuple(initial_noise_t.shape) != shape:
+                raise ValueError(
+                    f"initial_noise shape mismatch: expected {shape}, got {tuple(initial_noise_t.shape)}"
+                )
+        x_t = initial_noise_t.clone()
 
         chain_prev: List[torch.Tensor] = []
         chain_next: List[torch.Tensor] = []
@@ -210,6 +223,7 @@ class FrameVPGDiffusion:
             frame_logprobs_old_tensor = final_sample.new_empty((batch_size, 0, max_motion_frames))
 
         return {
+            "initial_noise": initial_noise_t.detach(),
             "final_sample": final_sample,
             "frame_features": final_sample.squeeze(2).permute(0, 2, 1).contiguous(),
             "text_embeds": text_embeds,

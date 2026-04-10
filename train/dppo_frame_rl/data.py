@@ -16,6 +16,8 @@ class PromptEntry:
     caption_idx: int
     caption: str
     tokens: str
+    start_20fps: int
+    gt_length_20fps: int
     length_20fps: int
 
 
@@ -37,14 +39,14 @@ def _parse_text_line(line: str) -> Tuple[str, str, float, float]:
     return caption, tokens, f_tag, to_tag
 
 
-def _compute_caption_length(motion_len_20fps: int, f_tag: float, to_tag: float) -> int:
+def _compute_caption_span(motion_len_20fps: int, f_tag: float, to_tag: float) -> Tuple[int, int]:
     if np.isnan(f_tag) or np.isnan(to_tag):
-        return max(1, int(motion_len_20fps))
+        return 0, max(1, int(motion_len_20fps))
     if abs(f_tag) < 1e-6 and abs(to_tag) < 1e-6:
-        return max(1, int(motion_len_20fps))
+        return 0, max(1, int(motion_len_20fps))
     start = max(0, int(f_tag * 20.0))
     end = max(start + 1, int(to_tag * 20.0))
-    return max(1, end - start)
+    return start, max(1, end - start)
 
 
 def _load_failure_index(path: Path) -> set:
@@ -99,16 +101,17 @@ def build_prompt_entries(
                     if failure_index is not None and (db_key, caption_idx) not in failure_index:
                         continue
                     caption, tokens, f_tag, to_tag = _parse_text_line(line)
-                    length_20fps = min(
-                        max_motion_frames,
-                        _compute_caption_length(motion_len, f_tag, to_tag),
-                    )
+                    start_20fps, caption_len_20fps = _compute_caption_span(motion_len, f_tag, to_tag)
+                    length_20fps = min(max_motion_frames, caption_len_20fps)
+                    start_20fps = min(max(0, start_20fps), max(0, motion_len - 1))
                     entries.append(
                         PromptEntry(
                             db_key=db_key,
                             caption_idx=caption_idx,
                             caption=caption,
                             tokens=tokens,
+                            start_20fps=start_20fps,
+                            gt_length_20fps=caption_len_20fps,
                             length_20fps=length_20fps,
                         )
                     )
@@ -250,8 +253,9 @@ def prompt_entries_to_meta(entries: Sequence[PromptEntry]) -> List[Dict]:
                 "caption_idx": entry.caption_idx,
                 "caption": entry.caption,
                 "tokens": entry.tokens,
+                "start_20fps": entry.start_20fps,
                 "length": entry.length_20fps,
-                "gt_len_20fps": entry.length_20fps,
+                "gt_len_20fps": entry.gt_length_20fps,
                 "text": entry.caption,
             }
         )
