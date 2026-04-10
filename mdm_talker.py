@@ -9,6 +9,7 @@ import os.path as osp
 import os
 import numpy as np
 import torch
+from typing import List, Optional, Sequence
 sys.path.append(os.getcwd())
 import shutil
 from mdm_core.data_loaders.humanml.data.dataset import HumanML3D
@@ -25,7 +26,6 @@ from mdm_core.data_loaders.humanml.utils.plot_script import plot_3d_motion
 
 from mdm_core.data_loaders.tensors import collate
 from mdm_core.sample.generate import construct_template_variables, save_multiple_samples, load_dataset
-from datetime import datetime
 
 class MDMTalker:
     def __init__(self):
@@ -38,6 +38,8 @@ class MDMTalker:
         max_frames = 196 if args.dataset in ['kit', 'humanml'] else 60
         fps = 12.5 if args.dataset == 'kit' else 20
         self.n_frames = n_frames = min(max_frames, int(args.motion_length*fps))
+        self.max_frames = max_frames
+        self.fps = fps
         is_using_data = False
         args.text_prompt = "Running around and jump up and down"
         dist_util.setup_dist(args.device)
@@ -110,40 +112,104 @@ class MDMTalker:
                                 arg, one_action, one_action_text in zip(collate_args, action, action_text)]
             _, self.model_kwargs = collate(collate_args)
 
-    def generate_motion(self, prompts, out_path = "mdm_out", num_repetitions = 1):
-        curr_date_time = datetime.now().strftime('%Y-%m-%d-%H:%M:%S')
-        
-        
-        args, model_kwargs, model, diffusion, data= self.args, self.model_kwargs, self.model, self.diffusion, self.data
-        model_kwargs['y']['text'] = prompts
-        
-        fps = 12.5 if args.dataset == 'kit' else 20
-        
+    def _normalize_prompts(self, prompts) -> List[str]:
+        if isinstance(prompts, str):
+            prompts = [prompts]
+        prompts = [str(prompt) for prompt in prompts]
+        if len(prompts) == 0:
+            raise ValueError("MDMTalker.generate_motion requires at least one prompt.")
+        return prompts
+
+    def _normalize_lengths(
+        self,
+        lengths_20fps: Optional[Sequence[int]],
+        batch_size: int,
+    ) -> List[int]:
+        if lengths_20fps is None:
+            raw_lengths = [self.n_frames] * batch_size
+        elif isinstance(lengths_20fps, (int, np.integer)):
+            if batch_size != 1:
+                raise ValueError("Scalar lengths_20fps is only valid for a single prompt.")
+            raw_lengths = [int(lengths_20fps)]
+        else:
+            raw_lengths = list(lengths_20fps)
+
+        if len(raw_lengths) != batch_size:
+            raise ValueError("prompts and lengths_20fps batch dimension mismatch.")
+
+        return [
+            min(self.max_frames, max(1, int(length if length is not None else self.n_frames)))
+            for length in raw_lengths
+        ]
+
+    def _build_model_kwargs(self, prompts: Sequence[str], lengths_20fps: Sequence[int]):
+        collate_args = [
+            {
+                'inp': torch.zeros(self.max_frames),
+                'tokens': None,
+                'lengths': int(length_20fps),
+                'text': prompt,
+            }
+            for prompt, length_20fps in zip(prompts, lengths_20fps)
+        ]
+        _, model_kwargs = collate(collate_args)
+        return model_kwargs
+
+    @staticmethod
+    def _append_smpl_hands(mdm_jts: np.ndarray) -> np.ndarray:
+        hand_len = 0.08824
+        eps = 1e-8
+        direction = (mdm_jts[...,  -2, :] - mdm_jts[...,  -4, :])
+        left = mdm_jts[...,  -2, :] + direction/np.maximum(
+            np.linalg.norm(direction, axis=-1, keepdims=True), eps
+        ) * hand_len
+        direction = (mdm_jts[...,  -1, :] - mdm_jts[...,  -3, :])
+        right = mdm_jts[...,  -1, :] + direction/np.maximum(
+            np.linalg.norm(direction, axis=-1, keepdims=True), eps
+        ) * hand_len
+        return np.concatenate([mdm_jts, left[...,  None, :], right[..., None, :]], axis = -2)
+
+    def generate_motion(
+        self,
+        prompts,
+        out_path = "mdm_out",
+        num_repetitions = 1,
+        lengths_20fps: Optional[Sequence[int]] = None,
+        show_progress: bool = True,
+    ):
+        del out_path
+
+        prompts = self._normalize_prompts(prompts)
+        batch_size = len(prompts)
+        target_lengths = self._normalize_lengths(lengths_20fps, batch_size)
+
+        args, model, diffusion, data = self.args, self.model, self.diffusion, self.data
+        model_kwargs = self._build_model_kwargs(prompts, target_lengths)
+
         all_motions = []
         all_lengths = []
         all_text = []
-        
-        total_num_samples  = self.n_frames * num_repetitions
-        batch_size = num_samples= len(prompts)
+
+        total_num_samples = batch_size * num_repetitions
 
         for rep_i in range(num_repetitions):
-            print(f'### Sampling [repetitions #{rep_i}]')
+            if show_progress:
+                print(f'### Sampling [repetitions #{rep_i}]')
 
             # add CFG scale to batch
             if args.guidance_param != 1:
                 model_kwargs['y']['scale'] = torch.ones(batch_size, device=dist_util.dev()) * args.guidance_param
 
             sample_fn = diffusion.p_sample_loop
-            
 
             sample = sample_fn(
                 model,
-                (batch_size, model.njoints, model.nfeats, self.n_frames),
+                (batch_size, model.njoints, model.nfeats, self.max_frames),
                 clip_denoised=False,
                 model_kwargs=model_kwargs,
                 skip_timesteps=0,  # 0 is the default value - i.e. don't skip any step
                 init_image=None,
-                progress=True,
+                progress=show_progress,
                 dump_steps=None,
                 noise=None,
                 const_noise=False,
@@ -157,14 +223,14 @@ class MDMTalker:
                 sample = sample.view(-1, *sample.shape[2:]).permute(0, 2, 3, 1)
 
             rot2xyz_pose_rep = 'xyz' if model.data_rep in ['xyz', 'hml_vec'] else model.data_rep
-            rot2xyz_mask = None if rot2xyz_pose_rep == 'xyz' else model_kwargs['y']['mask'].reshape(args.batch_size, self.n_frames).bool()
+            rot2xyz_mask = None if rot2xyz_pose_rep == 'xyz' else model_kwargs['y']['mask'].reshape(batch_size, self.max_frames).bool()
             
             sample = model.rot2xyz(x=sample, mask=rot2xyz_mask, pose_rep=rot2xyz_pose_rep, glob=True, translation=True,
                                 jointstype='smpl', vertstrans=True, betas=None, beta=0, glob_rot=None,
                                 get_rotations_back=False)
 
             if args.unconstrained:
-                all_text += ['unconstrained'] * args.num_samples
+                all_text += ['unconstrained'] * batch_size
             else:
                 text_key = 'text' if 'text' in model_kwargs['y'] else 'action_text'
                 all_text += model_kwargs['y'][text_key]
@@ -172,26 +238,29 @@ class MDMTalker:
             all_motions.append(sample.cpu().numpy())
             all_lengths.append(model_kwargs['y']['lengths'].cpu().numpy())
 
-            print(f"created {len(all_motions) * args.batch_size} samples")
+            if show_progress:
+                print(f"created {len(all_motions) * batch_size} samples")
 
 
         all_motions = np.concatenate(all_motions, axis=0)
         all_motions = all_motions[:total_num_samples]  # [bs, njoints, 6, seqlen]
         all_text = all_text[:total_num_samples]
-        all_lengths = all_lengths * batch_size
         all_lengths = np.concatenate(all_lengths, axis=0)[:total_num_samples]
 
-        ##### Convert to full SMPL
-        hand_len = 0.08824
-        mdm_jts = all_motions.transpose(0, 3, 1, 2).reshape(batch_size, -1, 22, 3)
-        
-        direction = (mdm_jts[...,  -2, :] - mdm_jts[...,  -4, :])
-        left = mdm_jts[...,  -2, :] + direction/np.linalg.norm(direction) * hand_len
-        direction = (mdm_jts[...,  -1, :] - mdm_jts[...,  -3, :])
-        right = mdm_jts[...,  -1, :] + direction/np.linalg.norm(direction) * hand_len
-        mdm_jts_smpl_24 = np.concatenate([mdm_jts, left[...,  None, :], right[..., None, :]], axis = -2)
-        
-        return mdm_jts_smpl_24.squeeze()
+        mdm_jts = all_motions.transpose(0, 3, 1, 2).reshape(total_num_samples, -1, 22, 3)
+        mdm_jts_smpl_24 = self._append_smpl_hands(mdm_jts)
+
+        motions = [
+            mdm_jts_smpl_24[sample_idx, : int(length_20fps)].astype(np.float32, copy=False)
+            for sample_idx, length_20fps in enumerate(all_lengths)
+        ]
+
+        if total_num_samples == 1:
+            return motions[0]
+        unique_lengths = {motion.shape[0] for motion in motions}
+        if len(unique_lengths) == 1:
+            return np.stack(motions, axis=0)
+        return motions
 
 
 if __name__ == "__main__":
