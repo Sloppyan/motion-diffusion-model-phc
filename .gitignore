@@ -144,3 +144,4 @@ data/
 data-failure/
 eval/
 wandb/
+output/
