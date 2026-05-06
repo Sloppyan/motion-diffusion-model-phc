@@ -14,13 +14,10 @@ def _orthogonal_init(module: nn.Module, gain: float) -> None:
             nn.init.constant_(module.bias, 0.0)
 
 
-class FrameNoisePolicy(nn.Module):
+class FrameNoiseMeanPolicy(nn.Module):
     """
-    Frame-wise Gaussian noise policy:
-        pi(w_f | c, f) = N(mu(c, e_f), diag(sigma^2))
-
-    The mean depends on text and frame index; the log-std is a shared
-    learnable vector and does not depend on state in the first version.
+    Frame-wise initial-noise policy with fixed unit std:
+        pi(z_f | c, f) = N(mu(c, f), I)
     """
 
     def __init__(
@@ -29,7 +26,6 @@ class FrameNoisePolicy(nn.Module):
         hidden_dim: int = 256,
         action_dim: int = 263,
         max_frames: int = 196,
-        log_std_init: float = 0.0,
     ):
         super().__init__()
         self.text_dim = int(text_dim)
@@ -37,10 +33,6 @@ class FrameNoisePolicy(nn.Module):
         self.action_dim = int(action_dim)
         self.max_frames = int(max_frames)
 
-        ##############################################
-        # Reuse MDM-style frame timestep embedding:
-        # PositionalEncoding -> Linear -> SiLU -> Linear.
-        ##############################################
         self.frame_pos_encoder = PositionalEncoding(self.hidden_dim, dropout=0.0, max_len=max_frames + 1)
         self.frame_embedder = TimestepEmbedder(self.hidden_dim, self.frame_pos_encoder)
 
@@ -54,15 +46,15 @@ class FrameNoisePolicy(nn.Module):
             nn.ReLU(),
         )
         self.mean_head = nn.Linear(self.hidden_dim, self.action_dim)
-        self.log_std = nn.Parameter(torch.full((self.action_dim,), float(log_std_init), dtype=torch.float32))
 
         self._reset_parameters()
 
     def _reset_parameters(self) -> None:
-        _orthogonal_init(self.text_proj, gain=torch.sqrt(torch.tensor(2.0)).item())
+        gain = torch.sqrt(torch.tensor(2.0)).item()
+        _orthogonal_init(self.text_proj, gain=gain)
         for module in self.trunk:
             if isinstance(module, nn.Linear):
-                _orthogonal_init(module, gain=torch.sqrt(torch.tensor(2.0)).item())
+                _orthogonal_init(module, gain=gain)
         _orthogonal_init(self.mean_head, gain=0.01)
 
     def _frame_features(self, frame_indices: torch.Tensor) -> torch.Tensor:
@@ -81,7 +73,7 @@ class FrameNoisePolicy(nn.Module):
 
     def dist(self, text_embeds: torch.Tensor, frame_indices: torch.Tensor) -> Independent:
         mean = self.forward(text_embeds, frame_indices)
-        std = self.log_std.exp().view(1, 1, -1).expand_as(mean)
+        std = torch.ones_like(mean)
         return Independent(Normal(mean, std), 1)
 
     def sample(
@@ -89,20 +81,31 @@ class FrameNoisePolicy(nn.Module):
         text_embeds: torch.Tensor,
         frame_indices: torch.Tensor,
         deterministic: bool = False,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        dist = self.dist(text_embeds, frame_indices)
-        actions = dist.mean if deterministic else dist.sample()
-        return actions, dist.log_prob(actions)
+        return_base_noise: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        ##############################################
+        # Keep the standard Gaussian exploration fixed and
+        # only let the policy learn the mean shift.
+        ##############################################
+        mean = self.forward(text_embeds, frame_indices)
+        if deterministic:
+            base_noise = torch.zeros_like(mean)
+            actions = mean
+        else:
+            base_noise = torch.randn_like(mean)
+            actions = mean + base_noise
+        log_prob = self._log_prob(actions, mean)
+        if return_base_noise:
+            return actions, log_prob, base_noise
+        return actions, log_prob, base_noise
+
+    def _log_prob(self, actions: torch.Tensor, mean: torch.Tensor) -> torch.Tensor:
+        return Independent(Normal(mean, torch.ones_like(mean)), 1).log_prob(actions)
 
     def log_prob(self, actions: torch.Tensor, text_embeds: torch.Tensor, frame_indices: torch.Tensor) -> torch.Tensor:
-        return self.dist(text_embeds, frame_indices).log_prob(actions)
+        mean = self.forward(text_embeds, frame_indices)
+        return self._log_prob(actions, mean)
 
     def entropy(self, text_embeds: torch.Tensor, frame_indices: torch.Tensor) -> torch.Tensor:
         return self.dist(text_embeds, frame_indices).entropy()
 
-    def prior_kl(self, text_embeds: torch.Tensor, frame_indices: torch.Tensor) -> torch.Tensor:
-        mean = self.forward(text_embeds, frame_indices)
-        log_std = self.log_std.view(1, 1, -1)
-        var = torch.exp(2.0 * log_std)
-        kl_per_dim = 0.5 * (mean.pow(2) + var - 1.0 - 2.0 * log_std)
-        return kl_per_dim.mean(dim=-1)

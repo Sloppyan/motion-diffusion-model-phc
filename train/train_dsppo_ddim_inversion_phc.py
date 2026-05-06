@@ -19,20 +19,27 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from train.dppo_frame_rl.data import (
-    build_prompt_entry_pools,
     build_prompt_entries,
+    build_prompt_entry_pools,
     sample_prompt_batch,
     select_eval_batch,
 )
 from train.dppo_frame_rl.logging import merge_metrics
 from train.dppo_frame_rl.models.frame_critic import FrameCritic
-from train.dsppo_rl import DSPPORuntime, FrameNoisePolicy
-from train.dsppo_rl.ppo import compute_noise_policy_loss
-
-try:
-    import wandb
-except ImportError:  # pragma: no cover - optional dependency
-    wandb = None
+from train.dsppo_rl.noise_policy_mean import FrameNoiseMeanPolicy
+from train.dsppo_rl.ppo_inversion import compute_noise_policy_inversion_loss
+from train.dsppo_rl.runtime_ddim import DSPPODDIMInversionRuntime
+from train.train_dsppo_phc import (
+    maybe_init_wandb,
+    normalize_advantages,
+    prefix_metrics,
+    resolve_scheduled_lr,
+    save_checkpoint,
+    select_best_metric,
+    set_optimizer_lr,
+    set_seed,
+    train_critic,
+)
 
 
 def parse_args():
@@ -62,9 +69,8 @@ def parse_args():
 
     parser.add_argument("--guidance_param", default=2.5, type=float)
     parser.add_argument("--noise_hidden_dim", default=256, type=int)
-    parser.add_argument("--noise_prior_kl_coef", default=0.0, type=float)
-    parser.add_argument("--noise_log_std_init", default=0.0, type=float)
-    parser.add_argument("--deterministic_denoising", action="store_true")
+    parser.add_argument("--inversion_loss_coef", default=0.0, type=float)
+    parser.add_argument("--ddim_eta", default=0.0, type=float)
     parser.add_argument("--deterministic_eval_policy", action="store_true")
 
     parser.add_argument("--frame_gamma", default=0.995, type=float)
@@ -106,137 +112,8 @@ def parse_args():
     parser.add_argument("--save_interval", default=10, type=int)
     parser.add_argument("--log_interval", default=1, type=int)
     parser.add_argument("--wandb_mode", default="disabled", choices=["disabled", "offline", "online"], type=str)
-    parser.add_argument("--wandb_project", default="mdm-phc-dsppo", type=str)
+    parser.add_argument("--wandb_project", default="mdm-phc-dsppo-ddim-inversion", type=str)
     return parser.parse_args()
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def prefix_metrics(prefix: str, metrics: Dict[str, float]) -> Dict[str, float]:
-    return {f"{prefix}{key}": value for key, value in metrics.items()}
-
-
-def masked_value_loss(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    mask_f = mask.float()
-    denom = mask_f.sum().clamp(min=1.0)
-    return 0.5 * (((pred - target) ** 2) * mask_f).sum() / denom
-
-
-def masked_explained_variance(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> float:
-    valid_pred = pred[mask]
-    valid_target = target[mask]
-    if valid_target.numel() == 0:
-        return float("nan")
-    var_target = valid_target.var(unbiased=False)
-    if float(var_target.item()) == 0.0:
-        return float("nan")
-    residual_var = (valid_target - valid_pred).var(unbiased=False)
-    return float((1.0 - residual_var / var_target).item())
-
-
-def normalize_advantages(
-    advantages: torch.Tensor,
-    mask: torch.Tensor,
-    std_only: bool = False,
-) -> Dict[str, torch.Tensor]:
-    valid = advantages[mask]
-    if valid.numel() == 0:
-        return {
-            "advantages": torch.zeros_like(advantages),
-            "adv_mean": advantages.new_zeros(()),
-            "adv_std": advantages.new_zeros(()),
-        }
-    mean = valid.mean()
-    std = valid.std(unbiased=False) + 1e-8
-    if std_only:
-        normalized = (advantages / std) * mask.float()
-    else:
-        normalized = ((advantages - mean) / std) * mask.float()
-    return {"advantages": normalized, "adv_mean": mean, "adv_std": std}
-
-
-def iter_sample_minibatches(num_samples: int, batch_size: int, device: torch.device):
-    permutation = torch.randperm(num_samples, device=device)
-    for start in range(0, num_samples, batch_size):
-        yield permutation[start : start + batch_size]
-
-
-def _cosine_decay(step: int, total_steps: int, max_lr: float, min_lr: float) -> float:
-    if total_steps <= 1:
-        return float(max_lr)
-    progress = float(step - 1) / float(total_steps - 1)
-    cosine = 0.5 * (1.0 + np.cos(np.pi * progress))
-    return float(min_lr + (max_lr - min_lr) * cosine)
-
-
-def resolve_scheduled_lr(schedule: str, step: int, total_steps: int, base_lr: float, min_lr: float) -> float:
-    if schedule == "constant":
-        return float(base_lr)
-    return _cosine_decay(step=step, total_steps=total_steps, max_lr=base_lr, min_lr=min_lr)
-
-
-def set_optimizer_lr(optimizer: torch.optim.Optimizer, lr: float) -> None:
-    for group in optimizer.param_groups:
-        group["lr"] = float(lr)
-
-
-def train_critic(args, critic, optimizer, rollout) -> Dict[str, float]:
-    metrics = {"value_loss": 0.0, "explained_variance": float("nan")}
-    if getattr(critic, "popart_enabled", False):
-        metrics.update({"popart_mu": 0.0})
-    num_updates = 0
-
-    if getattr(critic, "popart_enabled", False):
-        popart_stats = critic.update_popart_stats(rollout.frame_returns, rollout.frame_exec_mask)
-        metrics["popart_mu"] = float(popart_stats.get("popart_mu", 0.0))
-
-    for _ in range(args.critic_num_epochs):
-        for batch_inds in iter_sample_minibatches(rollout.frame_features.shape[0], args.critic_minibatch_size, rollout.frame_features.device):
-            target = rollout.frame_returns[batch_inds]
-            mask = rollout.frame_exec_mask[batch_inds]
-
-            if getattr(critic, "popart_enabled", False):
-                pred_norm = critic(rollout.frame_features[batch_inds], rollout.text_embeds[batch_inds], normalized=True)
-                target_norm = critic.normalize_targets(target)
-                loss = masked_value_loss(pred_norm, target_norm, mask)
-            else:
-                pred = critic(rollout.frame_features[batch_inds], rollout.text_embeds[batch_inds])
-                loss = masked_value_loss(pred, target, mask)
-
-            optimizer.zero_grad()
-            loss.backward()
-            if args.max_grad_norm is not None:
-                torch.nn.utils.clip_grad_norm_(critic.parameters(), args.max_grad_norm)
-            optimizer.step()
-
-            with torch.no_grad():
-                metrics["value_loss"] += float(loss.item())
-                num_updates += 1
-
-    with torch.no_grad():
-        pred = critic(rollout.frame_features, rollout.text_embeds)
-        metrics["explained_variance"] = masked_explained_variance(
-            pred=pred,
-            target=rollout.frame_returns,
-            mask=rollout.frame_exec_mask,
-        )
-
-    if num_updates == 0:
-        return metrics
-    averaged = {}
-    for key, value in metrics.items():
-        if key in {"explained_variance"}:
-            averaged[key] = value
-        elif key == "popart_mu" and getattr(critic, "popart_enabled", False):
-            averaged[key] = value
-        else:
-            averaged[key] = value / num_updates
-    return averaged
 
 
 def train_actor(args, noise_policy, actor_optimizer, rollout) -> Dict[str, float]:
@@ -244,16 +121,20 @@ def train_actor(args, noise_policy, actor_optimizer, rollout) -> Dict[str, float
     num_updates = 0
 
     for _ in range(args.actor_num_epochs):
-        for batch_inds in iter_sample_minibatches(len(rollout.texts), args.ppo_minibatch_size, rollout.frame_noise.device):
-            loss_dict = compute_noise_policy_loss(
+        permutation = torch.randperm(len(rollout.texts), device=rollout.frame_noise.device)
+        for start in range(0, len(rollout.texts), args.ppo_minibatch_size):
+            batch_inds = permutation[start : start + args.ppo_minibatch_size]
+            loss_dict = compute_noise_policy_inversion_loss(
                 noise_policy=noise_policy,
                 text_embeds=rollout.text_embeds[batch_inds],
                 frame_noise=rollout.frame_noise[batch_inds],
+                frame_noise_base=rollout.frame_noise_base[batch_inds],
+                frame_noise_gt_inv=rollout.frame_noise_gt_inv[batch_inds],
                 frame_logprobs_old=rollout.frame_logprobs_old[batch_inds],
                 frame_advantages=rollout.frame_advantages[batch_inds],
                 frame_exec_mask=rollout.frame_exec_mask[batch_inds],
                 clip_range=args.clip_range,
-                noise_prior_kl_coef=args.noise_prior_kl_coef,
+                inversion_loss_coef=args.inversion_loss_coef,
             )
 
             actor_optimizer.zero_grad()
@@ -273,50 +154,11 @@ def train_actor(args, noise_policy, actor_optimizer, rollout) -> Dict[str, float
     return {key: value / num_updates for key, value in metrics.items()}
 
 
-def save_checkpoint(
-    save_dir: Path,
-    filename: str,
-    step: int,
-    noise_policy,
-    critic,
-    actor_optimizer,
-    critic_optimizer,
-    args,
-) -> None:
-    save_dir.mkdir(parents=True, exist_ok=True)
-    checkpoint = {
-        "step": step,
-        "noise_policy": noise_policy.state_dict(),
-        "critic": critic.state_dict(),
-        "actor_optimizer": actor_optimizer.state_dict(),
-        "critic_optimizer": critic_optimizer.state_dict(),
-        "args": vars(args),
-    }
-    torch.save(checkpoint, save_dir / filename)
-
-
-def select_best_metric(merged_eval: Dict[str, float]) -> Optional[tuple]:
-    if "eval_failure/phc_return_mean" in merged_eval:
-        return "eval_failure/phc_return_mean", float(merged_eval["eval_failure/phc_return_mean"])
-    if "eval/phc_return_mean" in merged_eval:
-        return "eval/phc_return_mean", float(merged_eval["eval/phc_return_mean"])
-    return None
-
-
-def maybe_init_wandb(args):
-    if args.wandb_mode == "disabled" or wandb is None:
-        return None
-    return wandb.init(
-        project=args.wandb_project,
-        mode=args.wandb_mode,
-        name=args.run_name,
-        config=vars(args),
-        dir=str(Path(args.save_root).expanduser().resolve()),
-    )
-
-
 def main():
     args = parse_args()
+    if float(args.ddim_eta) != 0.0:
+        raise ValueError("Only deterministic DDIM is supported in this script; set --ddim_eta 0.")
+
     set_seed(args.seed)
 
     save_dir = Path(args.save_root).expanduser().resolve() / args.run_name
@@ -347,13 +189,12 @@ def main():
             failure_cases_file=args.failure_eval_cases_file,
         )
 
-    runtime = DSPPORuntime(args)
-    noise_policy = FrameNoisePolicy(
+    runtime = DSPPODDIMInversionRuntime(args)
+    noise_policy = FrameNoiseMeanPolicy(
         text_dim=runtime.actor.clip_dim,
         hidden_dim=args.noise_hidden_dim,
         action_dim=runtime.actor.njoints * runtime.actor.nfeats,
         max_frames=args.max_motion_frames,
-        log_std_init=args.noise_log_std_init,
     ).to(runtime.device)
     critic = FrameCritic(
         max_frames=args.max_motion_frames,
@@ -427,7 +268,7 @@ def main():
             if outer_step % args.log_interval == 0:
                 print(f"[train] step={outer_step} " + " ".join(f"{k}={v:.4f}" for k, v in sorted(train_metrics.items())))
             if wandb_run is not None:
-                wandb.log({**train_metrics, "outer_step": outer_step}, step=outer_step)
+                wandb_run.log({**train_metrics, "outer_step": outer_step}, step=outer_step)
 
             if outer_step % args.eval_interval == 0:
                 eval_batch = select_eval_batch(eval_entries, args.eval_prompt_batch_size, offset=0)
@@ -457,7 +298,7 @@ def main():
 
                 print(f"[eval] step={outer_step} " + " ".join(f"{k}={v:.4f}" for k, v in sorted(merged_eval.items())))
                 if wandb_run is not None:
-                    wandb.log({**merged_eval, "outer_step": outer_step}, step=outer_step)
+                    wandb_run.log({**merged_eval, "outer_step": outer_step}, step=outer_step)
 
                 best_metric = select_best_metric(merged_eval)
                 if best_metric is not None:
@@ -490,13 +331,13 @@ def main():
     finally:
         runtime.close()
         if wandb_run is not None:
-            wandb.finish()
+            wandb_run.finish()
 
 '''
-python train/train_dsppo_phc.py \
+python train/train_dsppo_ddim_inversion_phc.py \
   --model_path /home/gxy/hay-thesis/motion-diffusion-model-phc/save/humanml_enc_512_50steps/model000750000.pt \
   --data_root /home/gxy/hay-thesis/HumanML3D/HumanML3D \
-  --run_name dsppo_data_failure_0037_remove_determ\
+  --run_name dsppo_data_failure_0038_DDIM_prior_kl \
   --train_split train \
   --eval_split test \
   --train_sampling_mode failure_only \
@@ -508,8 +349,10 @@ python train/train_dsppo_phc.py \
   --critic_minibatch_size 256 \
   --actor_num_epochs 2 \
   --critic_num_epochs 2 \
-  --noise_prior_kl_coef 0.001 \
-  --pose_reward_weight 2.0 \
+  --inversion_loss_coef 0 \
+  --noise_prior_kl_coef 1e-5 \
+  --ddim_eta 0.0 \
+  --pose_reward_weight 1.0 \
   --pose_reward_alpha 5 \
   --lr_schedule cosine \
   --lr 1e-4 \
@@ -520,7 +363,6 @@ python train/train_dsppo_phc.py \
   --clip_range 2e-1 \
   --guidance_param 2.5 \
   --noise_hidden_dim 256 \
-  --noise_log_std_init -0.0 \
   --value_target_norm popart \
   --popart_beta 0.005 \
   --popart_epsilon 1e-5 \
@@ -534,13 +376,13 @@ python train/train_dsppo_phc.py \
   --log_interval 5 \
   --wandb_mode online \
   --fixed_sampling_seed \
-  --fail_penalty -0.1 \
+  --deterministic_eval_policy \
+  --fail_penalty -0.2 \
   --reward_norm \
   --dense_reward_weight 1.0 \
-  --velocity_reward_weight 0.5 \
-  --velocity_reward_alpha 0.5 \
-  --deterministic_denoising \
-  --deterministic_eval_policy \
+  --velocity_reward_weight 0.0 \
+  --velocity_reward_alpha 0.5
 '''
 if __name__ == "__main__":
     main()
+

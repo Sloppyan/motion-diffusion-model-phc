@@ -50,6 +50,7 @@ class DSPPORuntime:
         self.device = torch.device(f"cuda:{args.device_id}")
         self.max_motion_frames = int(args.max_motion_frames)
         self.deterministic_denoising = bool(args.deterministic_denoising)
+        self.stochastic_first_k_steps = max(0, int(getattr(args, "stochastic_first_k_steps", 0)))
 
         actor, diffusion = self._build_actor_and_diffusion(args.model_path)
         self.actor = actor
@@ -128,30 +129,50 @@ class DSPPORuntime:
         x_t: torch.Tensor,
         model_kwargs: Dict,
         deterministic_denoising: bool,
+        reverse_noise_seed: Optional[int] = None,
     ) -> torch.Tensor:
         ##############################################
         # Run the frozen reverse diffusion chain from x_T to x_0.
         # Deterministic mode removes the extra Gaussian at each reverse step.
+        # If stochastic_first_k_steps > 0, only the first k reverse steps
+        # inject noise and the rest become deterministic.
         ##############################################
         batch_size = x_t.shape[0]
-        with torch.no_grad():
-            for step in reversed(range(self.diffusion.num_timesteps)):
-                t = torch.full((batch_size,), step, dtype=torch.long, device=self.device)
-                out = self.diffusion.p_mean_variance(
-                    self.sampling_actor,
-                    x_t,
-                    t,
-                    clip_denoised=False,
-                    model_kwargs=model_kwargs,
-                )
-                if deterministic_denoising:
-                    x_prev = out["mean"]
-                else:
-                    noise = torch.randn_like(x_t)
-                    nonzero_mask = (t != 0).float().view(-1, *([1] * (x_t.dim() - 1)))
-                    x_prev = out["mean"] + nonzero_mask * torch.exp(0.5 * out["log_variance"]) * noise
-                x_t = x_prev
-        return x_t.detach()
+        devices = [] if self.device.index is None else [self.device.index]
+        num_timesteps = int(self.diffusion.num_timesteps)
+        first_stochastic_step = max(1, num_timesteps - self.stochastic_first_k_steps)
+
+        def _run_chain() -> torch.Tensor:
+            with torch.no_grad():
+                sample = x_t
+                for step in reversed(range(self.diffusion.num_timesteps)):
+                    t = torch.full((batch_size,), step, dtype=torch.long, device=self.device)
+                    out = self.diffusion.p_mean_variance(
+                        self.sampling_actor,
+                        sample,
+                        t,
+                        clip_denoised=False,
+                        model_kwargs=model_kwargs,
+                    )
+                    if self.stochastic_first_k_steps > 0:
+                        should_sample_noise = step >= first_stochastic_step
+                    else:
+                        should_sample_noise = not deterministic_denoising
+
+                    if should_sample_noise:
+                        noise = torch.randn_like(sample)
+                        nonzero_mask = (t != 0).float().view(-1, *([1] * (sample.dim() - 1)))
+                        x_prev = out["mean"] + nonzero_mask * torch.exp(0.5 * out["log_variance"]) * noise
+                    else:
+                        x_prev = out["mean"]
+                    sample = x_prev
+            return sample.detach()
+
+        if reverse_noise_seed is None:
+            return _run_chain()
+        with torch.random.fork_rng(devices=devices):
+            torch.manual_seed(int(reverse_noise_seed))
+            return _run_chain()
 
     @staticmethod
     def _fps_20_to_30(joints: np.ndarray) -> np.ndarray:
@@ -289,19 +310,39 @@ class DSPPORuntime:
         noise_policy: nn.Module,
         policy_deterministic: bool = False,
         sampling_seed: Optional[int] = None,
+        initial_noise_seed: Optional[int] = None,
+        reverse_noise_seed: Optional[int] = None,
     ) -> Dict[str, torch.Tensor]:
         texts = [entry.caption for entry in entries]
         lengths_20fps = torch.tensor([entry.length_20fps for entry in entries], dtype=torch.long, device=self.device)
         frame_indices = torch.arange(self.max_motion_frames, dtype=torch.long, device=self.device)
+        resolved_initial_seed = initial_noise_seed if initial_noise_seed is not None else sampling_seed
+        resolved_reverse_seed = reverse_noise_seed if reverse_noise_seed is not None else sampling_seed
 
-        def _sample_once() -> Dict[str, torch.Tensor]:
-            with torch.no_grad():
-                text_embeds = self.actor.encode_text(texts)
-                frame_noise, frame_logprobs_old = noise_policy.sample(
+        def _sample_frame_noise(text_embeds: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            devices = [] if self.device.index is None else [self.device.index]
+            if resolved_initial_seed is None:
+                return noise_policy.sample(
                     text_embeds=text_embeds,
                     frame_indices=frame_indices,
                     deterministic=policy_deterministic,
                 )
+            with torch.random.fork_rng(devices=devices):
+                torch.manual_seed(int(resolved_initial_seed))
+                return noise_policy.sample(
+                    text_embeds=text_embeds,
+                    frame_indices=frame_indices,
+                    deterministic=policy_deterministic,
+                )
+
+        def _sample_once() -> Dict[str, torch.Tensor]:
+            with torch.no_grad():
+                text_embeds = self.actor.encode_text(texts)
+                ##############################################
+                # Split RNG control for x_T sampling and reverse noise.
+                # This lets diagnostics hold one source fixed and vary the other.
+                ##############################################
+                frame_noise, frame_logprobs_old = _sample_frame_noise(text_embeds)
                 model_kwargs = self._build_model_kwargs(
                     texts=texts,
                     lengths_20fps=lengths_20fps,
@@ -313,6 +354,7 @@ class DSPPORuntime:
                     x_t=x_t,
                     model_kwargs=model_kwargs,
                     deterministic_denoising=self.deterministic_denoising,
+                    reverse_noise_seed=resolved_reverse_seed,
                 )
             return {
                 "texts": texts,
@@ -324,11 +366,7 @@ class DSPPORuntime:
                 "frame_features": final_sample.squeeze(2).permute(0, 2, 1).contiguous().detach(),
             }
 
-        if sampling_seed is None:
-            return _sample_once()
-        with torch.random.fork_rng(devices=[self.device.index]):
-            torch.manual_seed(int(sampling_seed))
-            return _sample_once()
+        return _sample_once()
 
     def collect_rollout(
         self,
@@ -359,7 +397,7 @@ class DSPPORuntime:
             max_motion_frames=self.max_motion_frames,
             gamma_frame=self.args.frame_gamma,
             dense_reward_weight=self.args.dense_reward_weight,
-            dense_reward_norm=self.args.dense_reward_norm,
+            reward_norm=self.args.reward_norm,
             success_bonus=self.args.success_bonus,
             fail_penalty=self.args.fail_penalty,
             device=self.device,
@@ -407,9 +445,9 @@ class DSPPORuntime:
             {
                 "dense_reward_mean": reward_batch.dense_reward_mean,
                 "imitation_pose_reward_mean": reward_batch.imitation_pose_reward_mean,
+                "pose_mse_mean": reward_batch.pose_mse_mean,
                 "imitation_velocity_reward_mean": reward_batch.imitation_velocity_reward_mean,
                 "terminal_reward_mean": reward_batch.terminal_reward_mean,
-                "failure_penalty_mean": reward_batch.failure_penalty_mean,
                 "undiscounted_sequence_reward_mean": reward_batch.undiscounted_sequence_reward_mean,
                 "exec_ratio_mean": reward_batch.exec_ratio_mean,
             },
@@ -442,7 +480,7 @@ class DSPPORuntime:
             max_motion_frames=self.max_motion_frames,
             gamma_frame=self.args.frame_gamma,
             dense_reward_weight=self.args.dense_reward_weight,
-            dense_reward_norm=self.args.dense_reward_norm,
+            reward_norm=self.args.reward_norm,
             success_bonus=self.args.success_bonus,
             fail_penalty=self.args.fail_penalty,
             device=self.device,
@@ -460,9 +498,9 @@ class DSPPORuntime:
             {
                 "dense_reward_mean": reward_batch.dense_reward_mean,
                 "imitation_pose_reward_mean": reward_batch.imitation_pose_reward_mean,
+                "pose_mse_mean": reward_batch.pose_mse_mean,
                 "imitation_velocity_reward_mean": reward_batch.imitation_velocity_reward_mean,
                 "terminal_reward_mean": reward_batch.terminal_reward_mean,
-                "failure_penalty_mean": reward_batch.failure_penalty_mean,
                 "undiscounted_sequence_reward_mean": reward_batch.undiscounted_sequence_reward_mean,
                 "exec_ratio_mean": reward_batch.exec_ratio_mean,
             },
