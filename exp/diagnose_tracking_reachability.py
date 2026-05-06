@@ -61,7 +61,8 @@ def parse_args():
     parser.add_argument("--resume_lora_path", default="", type=str)
 
     parser.add_argument("--dense_reward_weight", default=1.0, type=float)
-    parser.add_argument("--dense_reward_norm", action="store_true")
+    parser.set_defaults(reward_norm=False)
+    parser.add_argument("--reward_norm", dest="reward_norm", action="store_true")
     parser.add_argument("--success_bonus", default=0.0, type=float)
     parser.add_argument("--fail_penalty", default=-5.0, type=float)
     parser.add_argument("--frame_gamma", default=0.995, type=float)
@@ -249,7 +250,7 @@ python exp/diagnose_tracking_reachability.py \
   --clip_range 5e-2 \
   --phc_num_envs 32 \
   --phc_max_steps 420 \
-  --dense_reward_norm
+  --reward_norm
 '''
 if __name__ == "__main__":
     main()
